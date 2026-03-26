@@ -31,16 +31,20 @@ def main():
     parser = argparse.ArgumentParser()
     parser.add_argument("--model",  default="yolov8n.pt",
                         help="베이스 모델. yolov8n/s/m/l/x.pt 중 선택")
+    parser.add_argument("--data",   default=None,
+                        help="dataset yaml 경로 (기본: 스크립트 상위폴더/dataset_bird.yaml)")
     parser.add_argument("--epochs", type=int, default=50)
-    parser.add_argument("--imgsz",  type=int, default=320)  # 416→320: 속도 ~1.7배↑
-    parser.add_argument("--batch",  type=int, default=32)   # 16→32: iteration 절반
+    parser.add_argument("--imgsz",  type=int, default=320)
+    parser.add_argument("--batch",  type=int, default=32)
     parser.add_argument("--device", default="mps",
                         help="mps (Apple Silicon) / cpu / 0 (CUDA)")
     parser.add_argument("--name",   default="bird_v1")
     args = parser.parse_args()
 
-    if not YAML_PATH.exists():
-        print(f"[오류] dataset_bird.yaml 없음. 먼저 실행하세요:")
+    yaml_path = Path(args.data) if args.data else YAML_PATH
+
+    if not yaml_path.exists():
+        print(f"[오류] yaml 없음: {yaml_path}")
         print(f"  python scripts/prepare_bird_dataset.py")
         return
 
@@ -52,7 +56,7 @@ def main():
     print(f"\n{'='*55}")
     print(f"  Bird 전용 모델 학습")
     print(f"  베이스  : {base_model}")
-    print(f"  데이터  : {YAML_PATH}")
+    print(f"  데이터  : {yaml_path}")
     print(f"  클래스  : bird / drone / uncertain (3개)")
     print(f"  Epochs  : {args.epochs}")
     print(f"  저장    : runs/detect/{args.name}/weights/best.pt")
@@ -61,7 +65,7 @@ def main():
     model = YOLO(str(base_model))
 
     model.train(
-        data          = str(YAML_PATH),
+        data          = str(yaml_path),
         epochs        = args.epochs,
         imgsz         = args.imgsz,
         batch         = args.batch,
