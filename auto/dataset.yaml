@@ -1,0 +1,37 @@
+path: dataset
+train: images/train
+val: images/val
+
+nc: 31
+names:
+  0: LP
+  1: LP(P)
+  2: SI
+  3: SI(P)
+  4: COS
+  5: COS(P)
+  6: COS(C)
+  7: ICC
+  8: ISC
+  9: BSC
+  10: ACI
+  11: ACI(P)
+  12: LVI
+  13: BLI
+  14: LVSI(P)
+  15: switchgear
+  16: LA
+  17: BOSC
+  18: IPC
+  19: transformer
+  20: BT
+  21: BT(P)
+  22: SOW
+  23: DC
+  24: DEC
+  25: ILS
+  26: SE
+  27: STS
+  28: STS€
+  29: BR
+  30: IB

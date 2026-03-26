@@ -1,0 +1,19 @@
+# 데이터 (대용량)
+auto/dataset/
+auto/dataset_bird/
+auto/runs/
+auto/unlabeled/
+source/
+review/
+
+# 캐시/모델
+*.pkl
+*.pt
+*.pth
+__pycache__/
+*.pyc
+venv/
+.venv/
+
+# 기타
+*.zip

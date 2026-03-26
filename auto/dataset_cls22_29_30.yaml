@@ -1,0 +1,8 @@
+path: dataset_cls22_29_30
+train: images/train
+val: images/val
+nc: 3
+names:
+  0: SOW
+  1: BR
+  2: IB
