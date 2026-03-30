@@ -30,7 +30,7 @@ from PyQt5.QtCore import Qt, QThread, pyqtSignal, QPoint, QPointF, QRectF
 # ── 경로 ─────────────────────────────────────────────────────────────────────
 SCRIPT_DIR   = Path(__file__).resolve().parent   # = 프로젝트 루트
 PROJECT_ROOT = SCRIPT_DIR
-MODEL_PATH   = PROJECT_ROOT / "runs/detect/train/weights/best.pt"
+MODEL_PATH   = PROJECT_ROOT / "auto/runs/detect/train/weights/best.pt"
 DATASET_YAML = PROJECT_ROOT / "dataset.yaml"
 CONFIG_DIR   = SCRIPT_DIR / "config"
 REFS_DIR     = SCRIPT_DIR / "refs"
@@ -362,7 +362,7 @@ class ReviewWorker(QThread):
 
             for i in range(0, total, batch):
                 results = model.predict(img_paths[i:i+batch],
-                                        conf=self.conf, verbose=False)
+                                        conf=self.conf, device="mps", verbose=False)
                 for r in results:
                     boxes = r.boxes
                     if boxes is None or len(boxes) == 0:
