@@ -13,6 +13,7 @@ prepare_finetune.py
     cd ~/labeling/auto
     source venv/bin/activate
     python scripts/prepare_finetune.py [--dry-run]
+    python scripts/prepare_finetune.py --folder ../source/기자재_31_classes  # 폴더 직접 지정
 """
 
 import argparse
@@ -81,6 +82,8 @@ def main():
     parser.add_argument("--dry-run", action="store_true", help="실제 복사 없이 결과만 출력")
     parser.add_argument("--val-ratio", type=float, default=VAL_RATIO)
     parser.add_argument("--seed", type=int, default=SEED)
+    parser.add_argument("--folder", type=str, default=None,
+                        help="직접 지정할 소스 폴더 경로 (지정 시 키워드 필터 무시)")
     args = parser.parse_args()
 
     dry = args.dry_run
@@ -90,10 +93,17 @@ def main():
         print("[DRY-RUN 모드] 실제 파일 변경 없음\n")
 
     # ── 대상 폴더 수집 ────────────────────────────────────────────────────
-    target_folders = [
-        d for d in SOURCE_DIR.iterdir()
-        if d.is_dir() and any(kw in d.name for kw in INCLUDE_KEYWORDS)
-    ]
+    if args.folder:
+        folder_path = Path(args.folder).resolve()
+        if not folder_path.is_dir():
+            print(f"[오류] 폴더를 찾을 수 없습니다: {folder_path}")
+            return
+        target_folders = [folder_path]
+    else:
+        target_folders = [
+            d for d in SOURCE_DIR.iterdir()
+            if d.is_dir() and any(kw in d.name for kw in INCLUDE_KEYWORDS)
+        ]
     print(f"대상 폴더 {len(target_folders)}개:")
     for f in sorted(target_folders):
         print(f"  {f.name}")
