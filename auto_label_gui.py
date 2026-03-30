@@ -10,6 +10,7 @@
 import sys
 from pathlib import Path
 
+import torch
 import yaml
 from PyQt5.QtWidgets import (
     QApplication, QMainWindow, QWidget, QVBoxLayout, QHBoxLayout,
@@ -25,6 +26,15 @@ PROJECT_ROOT = SCRIPT_DIR          # 파일이 프로젝트 루트에 있을 때
 RUNS_DETECT  = PROJECT_ROOT / "auto" / "runs" / "detect"
 UNLABELED    = PROJECT_ROOT / "auto" / "unlabeled"
 AUTO_DIR     = PROJECT_ROOT / "auto"
+
+def get_device() -> str:
+    """환경에 따라 최적 디바이스 자동 감지 (mps → cuda → cpu)."""
+    if torch.backends.mps.is_available():
+        return "mps"
+    if torch.cuda.is_available():
+        return "cuda"
+    return "cpu"
+
 
 IMG_EXTS = {".jpg", ".jpeg", ".png", ".bmp"}
 
@@ -163,7 +173,7 @@ class AutoLabelWorker(QThread):
                     conf=self.conf,
                     iou=self.iou,
                     imgsz=self.imgsz,
-                    device="mps",
+                    device=get_device(),
                     verbose=False,
                 )
 

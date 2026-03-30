@@ -15,7 +15,17 @@ from pathlib import Path
 
 import cv2
 import numpy as np
+import torch
 import yaml
+
+
+def get_device() -> str:
+    """환경에 따라 최적 디바이스 자동 감지 (mps → cuda → cpu)."""
+    if torch.backends.mps.is_available():
+        return "mps"
+    if torch.cuda.is_available():
+        return "cuda"
+    return "cpu"
 from PyQt5.QtWidgets import (
     QApplication, QMainWindow, QWidget, QVBoxLayout, QHBoxLayout,
     QPushButton, QLabel, QFileDialog, QTableWidget, QTableWidgetItem,
@@ -362,7 +372,7 @@ class ReviewWorker(QThread):
 
             for i in range(0, total, batch):
                 results = model.predict(img_paths[i:i+batch],
-                                        conf=self.conf, device="mps", verbose=False)
+                                        conf=self.conf, device=get_device(), verbose=False)
                 for r in results:
                     boxes = r.boxes
                     if boxes is None or len(boxes) == 0:

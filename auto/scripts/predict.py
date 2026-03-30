@@ -4,10 +4,21 @@
 """
 import argparse
 from pathlib import Path
+
+import torch
 from ultralytics import YOLO
 
 # 프로젝트 루트 = scripts/ 의 상위 폴더 (어디서 실행해도 항상 고정)
 PROJECT_ROOT = Path(__file__).resolve().parent.parent
+
+
+def get_device() -> str:
+    """환경에 따라 최적 디바이스 자동 감지 (mps → cuda → cpu)."""
+    if torch.backends.mps.is_available():
+        return "mps"
+    if torch.cuda.is_available():
+        return "cuda"
+    return "cpu"
 
 
 def parse_args():
@@ -23,8 +34,8 @@ def parse_args():
                         help="NMS IoU threshold")
     parser.add_argument("--imgsz", type=int, default=640,
                         help="입력 이미지 크기")
-    parser.add_argument("--device", type=str, default="mps",
-                        help="디바이스 (mps / cpu / 0)")
+    parser.add_argument("--device", type=str, default=get_device(),
+                        help="디바이스 (auto 감지 / mps / cuda / cpu / 0)")
     parser.add_argument("--name", type=str, default="predict_v3",
                         help="결과 저장 폴더 이름 (runs/detect/<name>). 이미 존재하면 _2, _3, ... 자동 부여")
     parser.add_argument("--save_img", action="store_true",
@@ -64,6 +75,7 @@ def main():
     print(f"모델: {args.model}")
     print(f"소스: {args.source}")
     print(f"Confidence threshold: {args.conf}")
+    print(f"디바이스: {args.device}")
     print(f"출력 폴더: runs/detect/{run_name}")
 
     model = YOLO(str(model_path))

@@ -20,12 +20,23 @@ finetune.py
     --epochs 50       학습 epoch 수 (기본: mode별 자동)
     --imgsz 640       입력 해상도
     --batch  16       배치 크기 (GPU 메모리에 맞게 조정)
-    --device cpu      cpu / 0 / mps (Apple Silicon)
+    --device cpu      cpu / 0 (cuda) / mps (Apple Silicon) — 기본: 자동 감지
 """
 
 import argparse
 from pathlib import Path
+
+import torch
 from ultralytics import YOLO
+
+
+def get_device() -> str:
+    """환경에 따라 최적 디바이스 자동 감지 (mps → cuda → cpu)."""
+    if torch.backends.mps.is_available():
+        return "mps"
+    if torch.cuda.is_available():
+        return "cuda"
+    return "cpu"
 
 SCRIPT_DIR  = Path(__file__).resolve().parent
 AUTO_DIR    = SCRIPT_DIR.parent
@@ -62,8 +73,8 @@ def main():
     parser.add_argument("--epochs", type=int, default=None)
     parser.add_argument("--imgsz",  type=int, default=640)
     parser.add_argument("--batch",  type=int, default=16)
-    parser.add_argument("--device", type=str, default="mps",
-                        help="cpu / 0 (cuda:0) / mps (Apple Silicon)")
+    parser.add_argument("--device", type=str, default=get_device(),
+                        help="디바이스 (자동 감지 / mps / cuda / cpu / 0)")
     parser.add_argument("--name",   type=str, default=None,
                         help="저장 폴더명 (기본: finetune_v1 등)")
     args = parser.parse_args()

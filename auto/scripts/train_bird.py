@@ -14,13 +14,24 @@ bird / drone / uncertain 3-class 전용 YOLOv8 모델 신규 학습.
     --epochs  100          기본 100
     --imgsz   640
     --batch   16
-    --device  mps          cpu / mps (Apple Silicon) / 0 (CUDA)
+    --device  auto         cpu / mps (Apple Silicon) / cuda — 기본: 자동 감지
     --name    bird_v1      저장 폴더명
 """
 
 import argparse
 from pathlib import Path
+
+import torch
 from ultralytics import YOLO
+
+
+def get_device() -> str:
+    """환경에 따라 최적 디바이스 자동 감지 (mps → cuda → cpu)."""
+    if torch.backends.mps.is_available():
+        return "mps"
+    if torch.cuda.is_available():
+        return "cuda"
+    return "cpu"
 
 SCRIPT_DIR = Path(__file__).resolve().parent
 AUTO_DIR   = SCRIPT_DIR.parent
@@ -34,8 +45,8 @@ def main():
     parser.add_argument("--epochs", type=int, default=50)
     parser.add_argument("--imgsz",  type=int, default=320)  # 416→320: 속도 ~1.7배↑
     parser.add_argument("--batch",  type=int, default=32)   # 16→32: iteration 절반
-    parser.add_argument("--device", default="mps",
-                        help="mps (Apple Silicon) / cpu / 0 (CUDA)")
+    parser.add_argument("--device", default=get_device(),
+                        help="디바이스 (자동 감지 / mps / cuda / cpu / 0)")
     parser.add_argument("--name",   default="bird_v1")
     args = parser.parse_args()
 
@@ -72,7 +83,7 @@ def main():
         patience      = 20,
         save          = True,
         cache         = "disk",         # RAM 대신 디스크 캐시 → 메모리 절약
-        workers       = 2,             # MPS에선 적게 잡는게 안정적
+        workers       = 2,             # 적게 잡는게 안정적
         project       = str(AUTO_DIR / "runs/detect"),
         name          = args.name,
         exist_ok      = True,

@@ -10,6 +10,15 @@ from pathlib import Path
 
 import torch
 import yaml
+
+
+def get_device() -> str:
+    """환경에 따라 최적 디바이스 자동 감지 (mps → cuda → cpu)."""
+    if torch.backends.mps.is_available():
+        return "mps"
+    if torch.cuda.is_available():
+        return "cuda"
+    return "cpu"
 from ultralytics import YOLO
 
 
@@ -50,8 +59,8 @@ def parse_args():
                         help="입력 이미지 크기")
     parser.add_argument("--batch", type=int, default=16,
                         help="배치 사이즈 (-1 = auto)")
-    parser.add_argument("--device", type=str, default="mps",
-                        help="학습 디바이스 (mps / cpu / 0)")
+    parser.add_argument("--device", type=str, default=get_device(),
+                        help="학습 디바이스 (자동 감지 / mps / cuda / cpu / 0)")
     parser.add_argument("--name", type=str, default="train",
                         help="결과 저장 폴더 이름 (runs/detect/<name>)")
     parser.add_argument("--conf", type=float, default=0.25,
@@ -71,18 +80,15 @@ def check_environment(args):
     info(f"OS      : {platform.system()} {platform.machine()}")
 
     # 디바이스
-    if args.device == "mps":
-        if torch.backends.mps.is_available():
-            ok("MPS (Apple Silicon GPU) 사용 가능")
-        else:
-            warn("MPS 사용 불가 → CPU로 자동 전환될 수 있음")
-    elif args.device == "cpu":
+    d = args.device
+    if d == "mps":
+        ok("MPS (Apple Silicon GPU) 사용") if torch.backends.mps.is_available() else warn("MPS 사용 불가 → CPU 전환")
+    elif d == "cpu":
         warn("CPU 모드로 실행 (느림)")
+    elif torch.cuda.is_available():
+        ok(f"CUDA 사용 가능: {torch.cuda.get_device_name(0)}")
     else:
-        if torch.cuda.is_available():
-            ok(f"CUDA 사용 가능: {torch.cuda.get_device_name(0)}")
-        else:
-            warn("CUDA 사용 불가 → CPU로 전환될 수 있음")
+        warn(f"디바이스 '{d}' — CUDA 없음, CPU로 전환될 수 있음")
 
     print()
 
