@@ -1,4 +1,4 @@
-path: /Users/ahn/labeling/auto/dataset_bird
+path: dataset_bird
 train: images/train
 val: images/val
 
