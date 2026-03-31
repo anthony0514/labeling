@@ -120,10 +120,10 @@ def check_dataset(args):
         sys.exit(1)
     ok(f"dataset yaml 존재: {args.data}")
 
-    with open(yaml_path) as f:
+    with open(yaml_path, encoding='utf-8') as f:
         cfg = yaml.safe_load(f)
 
-    dataset_root = Path(cfg.get("path", "."))
+    dataset_root = (yaml_path.parent / cfg.get("path", ".")).resolve()
     nc = cfg.get("nc", "?")
     names = cfg.get("names", {})
     info(f"dataset 경로 : {dataset_root}")
