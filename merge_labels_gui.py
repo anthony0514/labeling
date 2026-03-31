@@ -342,6 +342,7 @@ class ImageCanvas(QLabel):
 
 # ── ConflictPanel ─────────────────────────────────────────────────────
 class ConflictPanel(QWidget):
+    """우측 패널: A 박스 / B 박스 / 충돌·중복 3섹션."""
     sig_jump = pyqtSignal(int)
 
     def __init__(self):
@@ -349,75 +350,81 @@ class ConflictPanel(QWidget):
         self.setFixedWidth(240)
         lay = QVBoxLayout(self)
         lay.setContentsMargins(4, 4, 4, 4)
+        lay.setSpacing(2)
 
-        lbl = QLabel("충돌 / 중복 목록")
-        lbl.setStyleSheet("font-weight:bold; color:#ddd; padding:2px 0;")
-        lay.addWidget(lbl)
+        self._list_a    = self._make_section(lay, "A 박스",      "#00C851")
+        self._list_b    = self._make_section(lay, "B 박스",      "#1E82FF")
+        self._list_conf = self._make_section(lay, "충돌 · 중복", "#FF8800")
 
-        self._list = QListWidget()
-        lay.addWidget(self._list, 1)
-        self._list.itemClicked.connect(
-            lambda item: self.sig_jump.emit(item.data(Qt.UserRole) or -1))
+        hint = QLabel("클릭 → 이미지에서 하이라이트  /  이미지 박스 클릭 → 토글")
+        hint.setStyleSheet("color:#666; font-size:9px; padding:2px;")
+        hint.setWordWrap(True)
+        lay.addWidget(hint)
 
-        # 범례
-        grp = QGroupBox("범례")
-        gl  = QVBoxLayout(grp)
-        gl.setSpacing(2)
-        for col, txt in [
-            ("#00C851", "폴더 A"),
-            ("#1E82FF", "폴더 B"),
-            ("#FF8800", "A 충돌"),
-            ("#DC3232", "B 충돌"),
-            ("#969696", "중복 (자동 제거)"),
-            ("#B450FF", "⊕ 합쳐진 박스"),
-        ]:
-            row = QHBoxLayout()
-            dot = QLabel("■")
-            dot.setStyleSheet(f"color:{col}; font-size:14px;")
-            row.addWidget(dot)
-            lbl2 = QLabel(txt)
-            lbl2.setStyleSheet("color:#ccc; font-size:11px;")
-            row.addWidget(lbl2)
-            row.addStretch()
-            gl.addLayout(row)
+    def _make_section(self, parent_lay, title: str, color: str) -> QListWidget:
+        lbl = QLabel(title)
+        lbl.setStyleSheet(
+            f"color:{color}; font-weight:bold; font-size:11px;"
+            f"padding:2px 6px; background:#252526;"
+            f"border-left:3px solid {color};")
+        parent_lay.addWidget(lbl)
+        lst = QListWidget()
+        lst.itemClicked.connect(self._on_clicked)
+        parent_lay.addWidget(lst, 1)
+        return lst
 
-        hint = QLabel("박스 클릭 → 포함/제외 토글")
-        hint.setStyleSheet("color:#888; font-size:10px; padding-top:4px;")
-        gl.addWidget(hint)
-        lay.addWidget(grp)
+    def _on_clicked(self, item: QListWidgetItem):
+        gid = item.data(Qt.UserRole)
+        if gid is not None:
+            self.sig_jump.emit(gid)
 
     def update(self, boxes: List[Box], names: List[str]):
-        self._list.clear()
+        self._list_a.clear()
+        self._list_b.clear()
+        self._list_conf.clear()
         seen: set[tuple] = set()
+
+        def _name(b: Box) -> str:
+            return names[b.cls] if b.cls < len(names) else str(b.cls)
+
+        def _add(lst: QListWidget, label: str, color: str, gid: int):
+            item = QListWidgetItem(label)
+            item.setForeground(QColor(color))
+            item.setData(Qt.UserRole, gid)
+            lst.addItem(item)
+
         for b in boxes:
+            n = _name(b)
+
+            # ── 합쳐진 박스 → 충돌 섹션에
             if b.source == 'M':
-                n = names[b.cls] if b.cls < len(names) else str(b.cls)
-                item = QListWidgetItem(f"⊕ 합침 {n}")
-                item.setForeground(QColor("#B450FF"))
-                item.setData(Qt.UserRole, b.gid)
-                self._list.addItem(item)
+                _add(self._list_conf, f"⊕ {n}", "#B450FF", b.gid)
+                continue
 
-            elif b.is_duplicate and not b.included:
-                n = names[b.cls] if b.cls < len(names) else str(b.cls)
-                item = QListWidgetItem(f"🔁 중복 [{b.source}] {n}")
-                item.setForeground(QColor("#969696"))
-                item.setData(Qt.UserRole, b.gid)
-                self._list.addItem(item)
+            # ── A / B 섹션
+            lst = self._list_a if b.source == 'A' else self._list_b
+            if not b.included:
+                _add(lst, f"✗ {n}", "#555555", b.gid)
+            elif b.conflict_idx >= 0 and not b.is_duplicate:
+                col = "#FF8800" if b.source == 'A' else "#DC3232"
+                _add(lst, f"⚠ {n}", col, b.gid)
+            else:
+                col = "#00C851" if b.source == 'A' else "#1E82FF"
+                _add(lst, f"✔ {n}", col, b.gid)
 
+            # ── 충돌·중복 섹션
+            if b.is_duplicate and not b.included:
+                _add(self._list_conf, f"🔁 [{b.source}] {n}", "#969696", b.gid)
             elif b.conflict_idx >= 0 and not b.is_duplicate:
                 pair = tuple(sorted([b.gid, b.conflict_idx]))
-                if pair in seen:
-                    continue
-                seen.add(pair)
-                other = next((x for x in boxes if x.gid == b.conflict_idx), None)
-                score = iou(b, other) if other else 0.0
-                n = names[b.cls] if b.cls < len(names) else str(b.cls)
-                item = QListWidgetItem(
-                    f"⚠ 충돌 [{b.source}] {n}  IoU={score:.2f}")
-                item.setForeground(
-                    QColor("#FF8800") if b.source == 'A' else QColor("#DC3232"))
-                item.setData(Qt.UserRole, b.gid)
-                self._list.addItem(item)
+                if pair not in seen:
+                    seen.add(pair)
+                    other = next((x for x in boxes if x.gid == b.conflict_idx), None)
+                    score = iou(b, other) if other else 0.0
+                    col = "#FF8800" if b.source == 'A' else "#DC3232"
+                    _add(self._list_conf,
+                         f"⚠ [{b.source}] {n}  {score:.2f}",
+                         col, b.gid)
 
 
 # ── MergeTool (메인 윈도우) ──────────────────────────────────────────
@@ -543,34 +550,35 @@ class MergeTool(QMainWindow):
             setattr(self, attr, sp)
         row.addWidget(grp2)
 
-        # 전체 저장
-        btn_all = QPushButton("💾 전체\n저장")
-        btn_all.setFixedSize(76, 60)
-        btn_all.setStyleSheet(
-            "background:#0e639c; color:#fff; font-weight:bold; border-radius:4px;")
-        btn_all.clicked.connect(self._save_all)
-        row.addWidget(btn_all)
+        # 전체 합치기 + 저장
+        for label, color, cb in [
+            ("⊕ 전체\n합치기", "#5a2d8a", self._union_merge_all),
+            ("💾 전체\n저장",   "#0e639c", self._save_all),
+        ]:
+            btn = QPushButton(label)
+            btn.setFixedSize(76, 60)
+            btn.setStyleSheet(
+                f"background:{color}; color:#fff; font-weight:bold; border-radius:4px;")
+            btn.clicked.connect(cb)
+            row.addWidget(btn)
 
         return row
 
     def _make_nav(self):
         row = QHBoxLayout()
         for text, cb in [
-            ("◀ 이전  [←]", lambda: self._nav(-1)),
-            ("다음 ▶  [→]", lambda: self._nav(1)),
+            ("◀ 이전  [A / ←]", lambda: self._nav(-1)),
+            ("다음 ▶  [D / →]", lambda: self._nav(1)),
         ]:
             b = QPushButton(text)
             b.clicked.connect(cb)
             row.addWidget(b)
         row.addStretch()
 
-        btn_help = QPushButton("❓ 도움말  [H]")
-        btn_help.clicked.connect(self._show_help)
-        row.addWidget(btn_help)
-
         for text, cb in [
-            ("⊕ 모두 합치기  [W]",         self._union_merge),
-            ("⚡ 충돌 자동 해결 (A 우선)  [E]", self._auto_resolve),
+            ("❓ 도움말  [H]",             self._show_help),
+            ("⊕ 합치기+저장  [Space]",     self._merge_and_save),
+            ("⊕ 합치기만  [W]",            self._union_merge),
             ("💾 이 이미지 저장  [S]",      self._save_cur),
         ]:
             b = QPushButton(text)
@@ -692,15 +700,11 @@ class MergeTool(QMainWindow):
         row = max(0, min(row, self._img_list.count() - 1))
         self._img_list.setCurrentRow(row)
 
-    # ── 자동 해결 ────────────────────────────────────────────────────
-    def _auto_resolve(self):
-        """충돌 박스 → A 우선, B 제외."""
-        for b in self._boxes:
-            if b.conflict_idx >= 0 and not b.is_duplicate:
-                b.included = (b.source == 'A')
-        self._canvas.refresh_boxes(self._boxes)
-        self._cpanel.update(self._boxes, self._names)
-        self._sb.showMessage("충돌 자동 해결 완료 (A 우선)")
+    # ── 합치기 + 저장 (Space) ────────────────────────────────────────
+    def _merge_and_save(self):
+        """모두 합치기 후 즉시 저장."""
+        self._union_merge()
+        self._save_cur()
 
     # ── 모두 합치기 ──────────────────────────────────────────────────
     def _union_merge(self):
@@ -789,6 +793,26 @@ class MergeTool(QMainWindow):
             self, "완료",
             f"{len(self._stems)}개 이미지 저장 완료\n→ {self._folder_out}")
 
+    # ── 전체 합치기 저장 ─────────────────────────────────────────────
+    def _union_merge_all(self):
+        """전체 이미지에 모두합치기 적용 후 저장."""
+        if not self._folder_out:
+            QMessageBox.warning(self, "경고", "출력 폴더를 먼저 선택하세요.")
+            return
+        if not self._stems:
+            return
+        self._folder_out.mkdir(parents=True, exist_ok=True)
+        prev_stem = self._cur_stem
+        for stem in self._stems:
+            self._load(stem)
+            self._union_merge()
+            self._write(stem, self._lines())
+        if prev_stem:
+            self._load(prev_stem)
+        QMessageBox.information(
+            self, "완료",
+            f"{len(self._stems)}개 이미지 합치기+저장 완료\n→ {self._folder_out}")
+
     # ── 임계값 변경 ──────────────────────────────────────────────────
     def _on_thresh_changed(self):
         if self._cur_stem:
@@ -797,14 +821,14 @@ class MergeTool(QMainWindow):
     # ── 키보드 단축키 ────────────────────────────────────────────────
     def keyPressEvent(self, ev):
         key = ev.key()
-        if key == Qt.Key_Left:
+        if key in (Qt.Key_Left,  Qt.Key_A):
             self._nav(-1)
-        elif key == Qt.Key_Right:
+        elif key in (Qt.Key_Right, Qt.Key_D):
             self._nav(1)
+        elif key == Qt.Key_Space:
+            self._merge_and_save()
         elif key == Qt.Key_S:
             self._save_cur()
-        elif key == Qt.Key_E:
-            self._auto_resolve()
         elif key == Qt.Key_W:
             self._union_merge()
         elif key == Qt.Key_H:
@@ -823,18 +847,18 @@ class MergeTool(QMainWindow):
         msg.setText("""
 <h3>⌨️ 키보드 단축키</h3>
 <table cellpadding="4">
-<tr><td><b>←</b></td><td>이전 이미지</td></tr>
-<tr><td><b>→</b></td><td>다음 이미지</td></tr>
+<tr><td><b>A / ←</b></td><td>이전 이미지</td></tr>
+<tr><td><b>D / →</b></td><td>다음 이미지</td></tr>
+<tr><td><b>Space</b></td><td>합치기 + 저장 (한 번에)</td></tr>
+<tr><td><b>W</b></td><td>합치기만 — 충돌/중복 쌍을 외접 박스 1개로</td></tr>
 <tr><td><b>S</b></td><td>현재 이미지 저장</td></tr>
-<tr><td><b>E</b></td><td>충돌 자동 해결 (A 우선)</td></tr>
-<tr><td><b>W</b></td><td>모두 합치기 — 충돌/중복 쌍을 외접 박스 1개로 합침</td></tr>
 <tr><td><b>H</b></td><td>이 도움말 보기</td></tr>
 <tr><td><b>Q / Esc</b></td><td>창 닫기</td></tr>
 </table>
 <h3>🖱️ 마우스</h3>
 <table cellpadding="4">
-<tr><td><b>박스 클릭</b></td><td>포함 / 제외 토글</td></tr>
-<tr><td><b>충돌 목록 클릭</b></td><td>해당 박스 하이라이트</td></tr>
+<tr><td><b>이미지 박스 클릭</b></td><td>포함 / 제외 토글</td></tr>
+<tr><td><b>우측 목록 클릭</b></td><td>해당 박스 하이라이트</td></tr>
 </table>
 <h3>🎨 색상 범례</h3>
 <table cellpadding="4">
