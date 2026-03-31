@@ -704,33 +704,36 @@ class MergeTool(QMainWindow):
 
     # ── 모두 합치기 ──────────────────────────────────────────────────
     def _union_merge(self):
-        """충돌/중복 쌍을 외접 bounding box 1개로 합치기."""
+        """충돌/중복 쌍을 외접 bounding box 1개로 합치기.
+        여러 번 눌러도 결과가 동일하도록 (멱등) 이전 합치기 결과를 먼저 초기화."""
+        # ① 이전 합치기로 생긴 'M' 박스 제거
+        self._boxes = [b for b in self._boxes if b.source != 'M']
+        # ② 충돌/중복 박스 included 상태 초기화 (이전 합치기에서 False 됐을 수 있음)
+        for b in self._boxes:
+            if b.conflict_idx >= 0:
+                b.included = True
+
+        # ③ 충돌/중복 쌍마다 union 박스 생성
         next_gid = max((b.gid for b in self._boxes), default=-1) + 1
         seen: set[tuple] = set()
         new_boxes: List[Box] = []
 
         for b in self._boxes:
-            # 이미 합쳐진 박스는 스킵
-            if b.source == 'M':
+            if b.conflict_idx < 0:
+                continue   # 충돌 없는 박스는 건드리지 않음
+            pair = tuple(sorted([b.gid, b.conflict_idx]))
+            if pair in seen:
+                b.included = False
                 continue
-
-            if b.conflict_idx >= 0:
-                pair = tuple(sorted([b.gid, b.conflict_idx]))
-                if pair in seen:
-                    b.included = False   # 상대방이 이미 처리 → 이쪽도 제외
-                    continue
-                seen.add(pair)
-                other = next((x for x in self._boxes if x.gid == b.conflict_idx), None)
-                if other:
-                    # A 쪽 박스를 기준으로 union 생성
-                    a_box = b if b.source == 'A' else other
-                    b_box = other if b.source == 'A' else b
-                    merged = union_box(a_box, b_box, next_gid)
-                    next_gid += 1
-                    new_boxes.append(merged)
-                    b.included = False
-                    other.included = False
-            # 일반 박스(충돌 없음)는 그대로 유지
+            seen.add(pair)
+            other = next((x for x in self._boxes if x.gid == b.conflict_idx), None)
+            if other:
+                a_box = b if b.source == 'A' else other
+                b_box = other if b.source == 'A' else b
+                new_boxes.append(union_box(a_box, b_box, next_gid))
+                next_gid += 1
+                b.included     = False
+                other.included = False
 
         self._boxes.extend(new_boxes)
         self._canvas.refresh_boxes(self._boxes)
