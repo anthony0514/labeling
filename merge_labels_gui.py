@@ -10,10 +10,12 @@ git merge conflict 방식으로 병합하는 GUI 도구.
 - 결과를 출력 폴더에 txt + 이미지 저장
 
 조작:
-  - 이미지 위 박스 클릭 → 포함/제외 토글
-  - 우측 충돌 목록 클릭 → 해당 박스 하이라이트
-  - ⚡ 자동 해결 → 충돌 시 A 우선 적용
-  - 💾 저장 → 현재 이미지만 / 전체 이미지
+  - 이미지 위 박스 클릭  → 포함/제외 토글
+  - 우측 충돌 목록 클릭  → 해당 박스 하이라이트
+  - ⚡ 자동 해결 (E)     → 충돌 시 A 우선 적용
+  - ⊕ 모두 합치기 (W)   → 충돌/중복 쌍을 외접 박스 1개로 합치기
+  - 💾 저장 (S)          → 현재 이미지만 / 전체 이미지
+  - H                    → 단축키 도움말
 """
 
 import sys
@@ -45,6 +47,7 @@ COL_B          = QColor(30,  130, 255)    # 파랑  - 폴더 B
 COL_CONF_A     = QColor(255, 140,   0)    # 주황  - A 충돌
 COL_CONF_B     = QColor(220,  50,  50)    # 빨강  - B 충돌
 COL_DUP        = QColor(150, 150, 150)    # 회색  - 중복(자동 제거)
+COL_MERGE      = QColor(180,  80, 255)    # 보라  - 합쳐진 박스
 COL_SEL        = QColor(255, 255,   0)    # 노랑  - 선택(하이라이트)
 
 DARK = """
@@ -77,7 +80,7 @@ class Box:
     cy:           float
     w:            float
     h:            float
-    source:       str           # 'A' | 'B'
+    source:       str           # 'A' | 'B' | 'M'(merged)
     included:     bool  = True
     conflict_idx: int   = -1   # 충돌 상대 박스 global index (-1: 없음)
     is_duplicate: bool  = False
@@ -167,6 +170,20 @@ def load_img(path: Path) -> Optional[np.ndarray]:
     return cv2.imdecode(raw, cv2.IMREAD_COLOR)
 
 
+def union_box(a: Box, b: Box, next_gid: int) -> Box:
+    """두 박스의 외접 bounding box를 반환. 클래스는 A 기준."""
+    x1 = min(a.cx - a.w / 2, b.cx - b.w / 2)
+    y1 = min(a.cy - a.h / 2, b.cy - b.h / 2)
+    x2 = max(a.cx + a.w / 2, b.cx + b.w / 2)
+    y2 = max(a.cy + a.h / 2, b.cy + b.h / 2)
+    return Box(
+        cls=a.cls,
+        cx=(x1 + x2) / 2, cy=(y1 + y2) / 2,
+        w=x2 - x1,        h=y2 - y1,
+        source='M', included=True, gid=next_gid,
+    )
+
+
 # ── ImageCanvas ──────────────────────────────────────────────────────
 class ImageCanvas(QLabel):
     """이미지 + YOLO 박스 표시. 클릭으로 박스 포함/제외 토글."""
@@ -240,6 +257,8 @@ class ImageCanvas(QLabel):
 
     def _box_color(self, box: Box) -> tuple[QColor, int]:
         """(색상, 알파) 반환."""
+        if box.source == 'M':
+            return (COL_MERGE, 240)
         if not box.included:
             return (COL_DUP, 80)
         if box.conflict_idx >= 0 and not box.is_duplicate:
@@ -270,7 +289,8 @@ class ImageCanvas(QLabel):
         # 라벨
         name = (self._names[box.cls]
                 if box.cls < len(self._names) else str(box.cls))
-        tag = f"[{'A' if box.source == 'A' else 'B'}] {name}"
+        src_tag = {'A': 'A', 'B': 'B', 'M': '⊕'}.get(box.source, box.source)
+        tag = f"[{src_tag}] {name}"
         if not box.included:
             tag += "  ✗"
 
@@ -349,6 +369,7 @@ class ConflictPanel(QWidget):
             ("#FF8800", "A 충돌"),
             ("#DC3232", "B 충돌"),
             ("#969696", "중복 (자동 제거)"),
+            ("#B450FF", "⊕ 합쳐진 박스"),
         ]:
             row = QHBoxLayout()
             dot = QLabel("■")
@@ -369,7 +390,14 @@ class ConflictPanel(QWidget):
         self._list.clear()
         seen: set[tuple] = set()
         for b in boxes:
-            if b.is_duplicate and not b.included:
+            if b.source == 'M':
+                n = names[b.cls] if b.cls < len(names) else str(b.cls)
+                item = QListWidgetItem(f"⊕ 합침 {n}")
+                item.setForeground(QColor("#B450FF"))
+                item.setData(Qt.UserRole, b.gid)
+                self._list.addItem(item)
+
+            elif b.is_duplicate and not b.included:
                 n = names[b.cls] if b.cls < len(names) else str(b.cls)
                 item = QListWidgetItem(f"🔁 중복 [{b.source}] {n}")
                 item.setForeground(QColor("#969696"))
@@ -396,7 +424,7 @@ class ConflictPanel(QWidget):
 class MergeTool(QMainWindow):
     def __init__(self):
         super().__init__()
-        self.setWindowTitle("NeuralD LabelMerge v1.0")
+        self.setWindowTitle("NeuralD LabelMerge v1.1")
         self.resize(1360, 820)
         self.setStyleSheet(DARK)
 
@@ -528,16 +556,22 @@ class MergeTool(QMainWindow):
     def _make_nav(self):
         row = QHBoxLayout()
         for text, cb in [
-            ("◀ 이전", lambda: self._nav(-1)),
-            ("다음 ▶", lambda: self._nav(1)),
+            ("◀ 이전  [←]", lambda: self._nav(-1)),
+            ("다음 ▶  [→]", lambda: self._nav(1)),
         ]:
             b = QPushButton(text)
             b.clicked.connect(cb)
             row.addWidget(b)
         row.addStretch()
+
+        btn_help = QPushButton("❓ 도움말  [H]")
+        btn_help.clicked.connect(self._show_help)
+        row.addWidget(btn_help)
+
         for text, cb in [
-            ("⚡ 충돌 자동 해결 (A 우선)", self._auto_resolve),
-            ("💾 이 이미지 저장",          self._save_cur),
+            ("⊕ 모두 합치기  [W]",         self._union_merge),
+            ("⚡ 충돌 자동 해결 (A 우선)  [E]", self._auto_resolve),
+            ("💾 이 이미지 저장  [S]",      self._save_cur),
         ]:
             b = QPushButton(text)
             b.clicked.connect(cb)
@@ -663,13 +697,45 @@ class MergeTool(QMainWindow):
         """충돌 박스 → A 우선, B 제외."""
         for b in self._boxes:
             if b.conflict_idx >= 0 and not b.is_duplicate:
-                if b.source == 'B':
-                    b.included = False
-                else:
-                    b.included = True
+                b.included = (b.source == 'A')
         self._canvas.refresh_boxes(self._boxes)
         self._cpanel.update(self._boxes, self._names)
         self._sb.showMessage("충돌 자동 해결 완료 (A 우선)")
+
+    # ── 모두 합치기 ──────────────────────────────────────────────────
+    def _union_merge(self):
+        """충돌/중복 쌍을 외접 bounding box 1개로 합치기."""
+        next_gid = max((b.gid for b in self._boxes), default=-1) + 1
+        seen: set[tuple] = set()
+        new_boxes: List[Box] = []
+
+        for b in self._boxes:
+            # 이미 합쳐진 박스는 스킵
+            if b.source == 'M':
+                continue
+
+            if b.conflict_idx >= 0:
+                pair = tuple(sorted([b.gid, b.conflict_idx]))
+                if pair in seen:
+                    b.included = False   # 상대방이 이미 처리 → 이쪽도 제외
+                    continue
+                seen.add(pair)
+                other = next((x for x in self._boxes if x.gid == b.conflict_idx), None)
+                if other:
+                    # A 쪽 박스를 기준으로 union 생성
+                    a_box = b if b.source == 'A' else other
+                    b_box = other if b.source == 'A' else b
+                    merged = union_box(a_box, b_box, next_gid)
+                    next_gid += 1
+                    new_boxes.append(merged)
+                    b.included = False
+                    other.included = False
+            # 일반 박스(충돌 없음)는 그대로 유지
+
+        self._boxes.extend(new_boxes)
+        self._canvas.refresh_boxes(self._boxes)
+        self._cpanel.update(self._boxes, self._names)
+        self._sb.showMessage(f"모두 합치기 완료 — 합쳐진 박스 {len(new_boxes)}개 생성")
 
     # ── 저장 ──────────────────────────────────────────────────────────
     def _lines(self) -> List[str]:
@@ -724,6 +790,60 @@ class MergeTool(QMainWindow):
     def _on_thresh_changed(self):
         if self._cur_stem:
             self._load(self._cur_stem)
+
+    # ── 키보드 단축키 ────────────────────────────────────────────────
+    def keyPressEvent(self, ev):
+        key = ev.key()
+        if key == Qt.Key_Left:
+            self._nav(-1)
+        elif key == Qt.Key_Right:
+            self._nav(1)
+        elif key == Qt.Key_S:
+            self._save_cur()
+        elif key == Qt.Key_E:
+            self._auto_resolve()
+        elif key == Qt.Key_W:
+            self._union_merge()
+        elif key == Qt.Key_H:
+            self._show_help()
+        elif key in (Qt.Key_Q, Qt.Key_Escape):
+            self.close()
+        else:
+            super().keyPressEvent(ev)
+
+    # ── 도움말 ──────────────────────────────────────────────────────
+    def _show_help(self):
+        from PyQt5.QtWidgets import QMessageBox
+        msg = QMessageBox(self)
+        msg.setWindowTitle("단축키 도움말")
+        msg.setStyleSheet("QLabel{color:#222;} QMessageBox{background:#fff;}")
+        msg.setText("""
+<h3>⌨️ 키보드 단축키</h3>
+<table cellpadding="4">
+<tr><td><b>←</b></td><td>이전 이미지</td></tr>
+<tr><td><b>→</b></td><td>다음 이미지</td></tr>
+<tr><td><b>S</b></td><td>현재 이미지 저장</td></tr>
+<tr><td><b>E</b></td><td>충돌 자동 해결 (A 우선)</td></tr>
+<tr><td><b>W</b></td><td>모두 합치기 — 충돌/중복 쌍을 외접 박스 1개로 합침</td></tr>
+<tr><td><b>H</b></td><td>이 도움말 보기</td></tr>
+<tr><td><b>Q / Esc</b></td><td>창 닫기</td></tr>
+</table>
+<h3>🖱️ 마우스</h3>
+<table cellpadding="4">
+<tr><td><b>박스 클릭</b></td><td>포함 / 제외 토글</td></tr>
+<tr><td><b>충돌 목록 클릭</b></td><td>해당 박스 하이라이트</td></tr>
+</table>
+<h3>🎨 색상 범례</h3>
+<table cellpadding="4">
+<tr><td style="color:#00C851">■</td><td>폴더 A 박스</td></tr>
+<tr><td style="color:#1E82FF">■</td><td>폴더 B 박스</td></tr>
+<tr><td style="color:#FF8800">■</td><td>A 충돌 박스</td></tr>
+<tr><td style="color:#DC3232">■</td><td>B 충돌 박스</td></tr>
+<tr><td style="color:#969696">■</td><td>중복 (자동 제거)</td></tr>
+<tr><td style="color:#B450FF">■</td><td>⊕ 합쳐진 박스</td></tr>
+</table>
+""")
+        msg.exec_()
 
     # ── 클래스명 자동 로드 ────────────────────────────────────────────
     def _try_load_names(self):
