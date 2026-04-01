@@ -456,6 +456,9 @@ class MergeTool(QMainWindow):
         # 상단 툴바
         vlay.addLayout(self._make_toolbar())
 
+        # 덮어씌우기 행
+        vlay.addLayout(self._make_copy_row())
+
         # 메인 스플리터
         sp = QSplitter(Qt.Horizontal)
 
@@ -562,6 +565,37 @@ class MergeTool(QMainWindow):
             btn.clicked.connect(cb)
             row.addWidget(btn)
 
+        return row
+
+    def _make_copy_row(self):
+        """A→B / B→A 덮어씌우기 버튼 행."""
+        row = QHBoxLayout()
+        row.setSpacing(4)
+
+        lbl = QLabel("덮어씌우기  (한쪽에만 있는 박스 → 반대편에 추가):")
+        lbl.setStyleSheet("color:#888; font-size:11px; padding:0 4px;")
+        row.addWidget(lbl)
+
+        for text, color, src, all_ in [
+            ("A → B  (이 이미지)",  "#1a6e30", 'A', False),
+            ("A → B  (전체)",       "#0e4020", 'A', True),
+            ("B → A  (이 이미지)",  "#0e3d7a", 'B', False),
+            ("B → A  (전체)",       "#082550", 'B', True),
+        ]:
+            btn = QPushButton(text)
+            btn.setFixedHeight(26)
+            btn.setStyleSheet(
+                f"QPushButton{{background:{color}; color:#eee; border-radius:3px;"
+                f"border:1px solid {color}cc; padding:2px 8px; font-size:12px;}}"
+                f"QPushButton:hover{{background:{color}cc;}}"
+                f"QPushButton:disabled{{background:#2a2a2a; color:#555;}}")
+            # 클로저 캡처
+            def _cb(s=src, a=all_):
+                return lambda: (self._overwrite_all(s) if a else self._overwrite_cur(s))
+            btn.clicked.connect(_cb())
+            row.addWidget(btn)
+
+        row.addStretch()
         return row
 
     def _make_nav(self):
@@ -792,6 +826,60 @@ class MergeTool(QMainWindow):
         QMessageBox.information(
             self, "완료",
             f"{len(self._stems)}개 이미지 저장 완료\n→ {self._folder_out}")
+
+    # ── A↔B 덮어씌우기 ──────────────────────────────────────────────
+    def _apply_unique(self, src: str, tgt_folder: Path, stem: str) -> int:
+        """src에만 있는 박스(충돌/중복 없음)를 tgt_folder/stem.txt 에 추가.
+        반환: 추가된 박스 수."""
+        unique = [b for b in self._boxes
+                  if b.source == src and b.conflict_idx < 0]
+        if not unique:
+            return 0
+        txt_path = tgt_folder / (stem + '.txt')
+        existing = []
+        if txt_path.exists():
+            existing = [l.strip()
+                        for l in txt_path.read_text(encoding='utf-8').splitlines()
+                        if l.strip()]
+        new_lines = [f"{b.cls} {b.cx:.6f} {b.cy:.6f} {b.w:.6f} {b.h:.6f}"
+                     for b in unique]
+        txt_path.write_text('\n'.join(existing + new_lines), encoding='utf-8')
+        return len(new_lines)
+
+    def _overwrite_cur(self, src: str):
+        """현재 이미지: src 에만 있는 박스를 반대편 폴더 txt 에 추가."""
+        if not self._cur_stem:
+            return
+        tgt = 'B' if src == 'A' else 'A'
+        tgt_folder = self._folder_b if src == 'A' else self._folder_a
+        if not tgt_folder:
+            QMessageBox.warning(self, "경고", f"폴더 {tgt} 가 없습니다.")
+            return
+        n = self._apply_unique(src, tgt_folder, self._cur_stem)
+        self._load(self._cur_stem)   # txt 변경 반영
+        self._sb.showMessage(
+            f"{src} → {tgt} 완료: {n}개 박스 추가  ({self._cur_stem})")
+
+    def _overwrite_all(self, src: str):
+        """전체 이미지: src 에만 있는 박스를 반대편 폴더 txt 에 추가."""
+        tgt = 'B' if src == 'A' else 'A'
+        tgt_folder = self._folder_b if src == 'A' else self._folder_a
+        if not tgt_folder:
+            QMessageBox.warning(self, "경고", f"폴더 {tgt} 가 없습니다.")
+            return
+        if not self._stems:
+            return
+        prev_stem = self._cur_stem
+        total = 0
+        for stem in self._stems:
+            self._load(stem)
+            total += self._apply_unique(src, tgt_folder, stem)
+        if prev_stem:
+            self._load(prev_stem)
+        QMessageBox.information(
+            self, "완료",
+            f"전체 {len(self._stems)}개 이미지\n"
+            f"{src} → {tgt}: 총 {total}개 박스 추가\n→ {tgt_folder}")
 
     # ── 전체 합치기 저장 ─────────────────────────────────────────────
     def _union_merge_all(self):
