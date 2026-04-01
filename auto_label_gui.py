@@ -411,18 +411,30 @@ class AutoLabelWindow(QMainWindow):
         src_row.addWidget(btn_src)
         layout.addLayout(src_row)
 
+        # ── 입출력 동일 체크박스 ──────────────────────────────────────────
+        self.chk_same_folder = QCheckBox("📌  입출력 폴더 동일  (소스 폴더에 txt 저장)")
+        self.chk_same_folder.setChecked(True)
+        self.chk_same_folder.toggled.connect(self._on_same_folder_toggled)
+        self.src_edit.textChanged.connect(self._on_src_edit_changed)
+        layout.addWidget(self.chk_same_folder)
+
         # ── 출력 폴더 ─────────────────────────────────────────────────────
-        layout.addWidget(self._section("출력 폴더  (txt 저장)"))
+        out_sec_row = QHBoxLayout()
+        out_sec_row.addWidget(self._section("출력 폴더  (txt 저장)"))
+        out_sec_row.addStretch()
+        layout.addLayout(out_sec_row)
 
         out_row = QHBoxLayout()
         self.out_edit = QLineEdit(str(UNLABELED))
         self.out_edit.setPlaceholderText("txt 파일을 저장할 폴더")
         out_row.addWidget(self.out_edit)
-        btn_out = QPushButton("찾아보기...")
-        btn_out.setFixedWidth(90)
-        btn_out.clicked.connect(self._browse_output)
-        out_row.addWidget(btn_out)
+        self.btn_out = QPushButton("찾아보기...")
+        self.btn_out.setFixedWidth(90)
+        self.btn_out.clicked.connect(self._browse_output)
+        out_row.addWidget(self.btn_out)
         layout.addLayout(out_row)
+        # 초기 상태: 동일 체크 → 출력 필드 비활성
+        self._on_same_folder_toggled(True)
 
         # ── 쓰기 모드 ─────────────────────────────────────────────────────
         mode_row = QHBoxLayout()
@@ -570,16 +582,25 @@ class AutoLabelWindow(QMainWindow):
         conv_src_row.addWidget(btn_conv_src)
         layout.addLayout(conv_src_row)
 
+        # ── 입출력 동일 체크박스 ──────────────────────────────────────────
+        self.chk_conv_same_folder = QCheckBox("📌  입출력 폴더 동일  (소스 폴더에 덮어쓰기)")
+        self.chk_conv_same_folder.setChecked(True)
+        self.chk_conv_same_folder.toggled.connect(self._on_conv_same_folder_toggled)
+        self.conv_src_edit.textChanged.connect(self._on_conv_src_edit_changed)
+        layout.addWidget(self.chk_conv_same_folder)
+
         layout.addWidget(self._section("출력 폴더  (변환된 .txt 저장 위치)"))
         conv_out_row = QHBoxLayout()
         self.conv_out_edit = QLineEdit()
-        self.conv_out_edit.setPlaceholderText("변환 결과를 저장할 폴더 (소스 폴더와 동일하게 하면 덮어쓰기)")
+        self.conv_out_edit.setPlaceholderText("변환 결과를 저장할 폴더")
         conv_out_row.addWidget(self.conv_out_edit)
-        btn_conv_out = QPushButton("찾아보기...")
-        btn_conv_out.setFixedWidth(90)
-        btn_conv_out.clicked.connect(self._browse_conv_out)
-        conv_out_row.addWidget(btn_conv_out)
+        self.btn_conv_out = QPushButton("찾아보기...")
+        self.btn_conv_out.setFixedWidth(90)
+        self.btn_conv_out.clicked.connect(self._browse_conv_out)
+        conv_out_row.addWidget(self.btn_conv_out)
         layout.addLayout(conv_out_row)
+        # 초기 상태: 동일 체크 → 출력 필드 비활성
+        self._on_conv_same_folder_toggled(True)
 
         # 실행 버튼
         conv_run_row = QHBoxLayout()
@@ -633,8 +654,7 @@ class AutoLabelWindow(QMainWindow):
                                              str(SCRIPT_DIR))
         if d:
             self.conv_src_edit.setText(d)
-            if not self.conv_out_edit.text().strip():
-                self.conv_out_edit.setText(d)
+            # textChanged 시그널이 _on_conv_src_edit_changed 를 통해 자동 sync
 
     def _browse_conv_out(self):
         d = QFileDialog.getExistingDirectory(self, "출력 폴더 선택",
@@ -866,12 +886,37 @@ class AutoLabelWindow(QMainWindow):
                                                    self.src_edit.text())
         if folder:
             self.src_edit.setText(folder)
+            # textChanged → _on_src_edit_changed 가 자동 sync
 
     def _browse_output(self):
         folder = QFileDialog.getExistingDirectory(self, "출력 폴더 선택",
                                                    self.out_edit.text())
         if folder:
             self.out_edit.setText(folder)
+
+    # ── 입출력 동일 체크 핸들러 (Tab1) ───────────────────────────────────
+    def _on_same_folder_toggled(self, checked: bool):
+        """체크 ON → 출력 폴더를 소스 폴더와 동기화하고 편집 불가."""
+        if checked:
+            self.out_edit.setText(self.src_edit.text())
+        self.out_edit.setEnabled(not checked)
+        self.btn_out.setEnabled(not checked)
+
+    def _on_src_edit_changed(self, text: str):
+        """소스 폴더 경로 변경 시 체크가 ON이면 출력 폴더도 동기화."""
+        if self.chk_same_folder.isChecked():
+            self.out_edit.setText(text)
+
+    # ── 입출력 동일 체크 핸들러 (Tab2) ───────────────────────────────────
+    def _on_conv_same_folder_toggled(self, checked: bool):
+        if checked:
+            self.conv_out_edit.setText(self.conv_src_edit.text())
+        self.conv_out_edit.setEnabled(not checked)
+        self.btn_conv_out.setEnabled(not checked)
+
+    def _on_conv_src_edit_changed(self, text: str):
+        if self.chk_conv_same_folder.isChecked():
+            self.conv_out_edit.setText(text)
 
     # ── 실행 / 중단 ───────────────────────────────────────────────────────
     def _run(self):
