@@ -6,6 +6,7 @@
 - 클래스 역변환: 모델 yaml ↔ 출력 yaml 이름 매칭
 - Confidence / IoU 조정
 - 진행 상황 실시간 표시
+- [Tab2] TXT 클래스 변환: config 폴더 두 개 선택 → obj.names 기준으로 클래스 ID 재매핑
 """
 import sys
 from pathlib import Path
@@ -16,8 +17,9 @@ from PyQt5.QtWidgets import (
     QApplication, QMainWindow, QWidget, QVBoxLayout, QHBoxLayout,
     QPushButton, QLabel, QFileDialog, QProgressBar, QTextEdit,
     QDoubleSpinBox, QComboBox, QLineEdit, QSizePolicy, QButtonGroup, QRadioButton,
+    QTabWidget, QCheckBox, QListWidget, QListWidgetItem,
 )
-from PyQt5.QtGui import QFont
+from PyQt5.QtGui import QFont, QColor
 from PyQt5.QtCore import Qt, QThread, pyqtSignal
 
 # ── 경로 기본값 ───────────────────────────────────────────────────────────────
@@ -104,6 +106,31 @@ def find_yaml_files() -> list[Path]:
     if not AUTO_DIR.exists():
         return []
     return sorted(AUTO_DIR.glob("*.yaml"))
+
+
+# ── Config 폴더 유틸 (TXT 변환용) ────────────────────────────────────────────
+def load_obj_names(config_dir: Path) -> dict:
+    """config 폴더의 obj.names → {id: name}."""
+    names_path = config_dir / "obj.names"
+    if not names_path.exists():
+        raise ValueError(f"obj.names 없음: {names_path}")
+    with open(names_path, encoding="utf-8") as f:
+        lines = [l.strip() for l in f if l.strip()]
+    return {i: name for i, name in enumerate(lines)}
+
+
+def build_config_remap(src_names: dict, tgt_names: dict) -> tuple:
+    """소스 config → 타겟 config 클래스 ID 매핑.
+    반환: (remap: {src_id → tgt_id}, skipped: [(src_id, name)])"""
+    tgt_by_name = {v: k for k, v in tgt_names.items()}
+    remap   = {}
+    skipped = []
+    for src_id, name in sorted(src_names.items()):
+        if name in tgt_by_name:
+            remap[src_id] = tgt_by_name[name]
+        else:
+            skipped.append((src_id, name))
+    return remap, skipped
 
 
 # ══════════════════════════════════════════════════════════════════════════════
@@ -208,23 +235,114 @@ class AutoLabelWorker(QThread):
 
 
 # ══════════════════════════════════════════════════════════════════════════════
+# TXT 클래스 변환 워커
+# ══════════════════════════════════════════════════════════════════════════════
+class ConvertWorker(QThread):
+    progress = pyqtSignal(int, int)
+    log      = pyqtSignal(str)
+    finished = pyqtSignal(int, int)   # (converted_files, skipped_boxes)
+    error    = pyqtSignal(str)
+
+    def __init__(self, src_folder: Path, out_folder: Path,
+                 remap: dict, skip_unmatched: bool = True,
+                 overwrite: bool = True):
+        super().__init__()
+        self.src_folder      = src_folder
+        self.out_folder      = out_folder
+        self.remap           = remap           # {src_id: tgt_id}
+        self.skip_unmatched  = skip_unmatched  # True=제외, False=원본 ID 유지
+        self.overwrite       = overwrite
+        self._stop           = False
+
+    def stop(self):
+        self._stop = True
+
+    def run(self):
+        try:
+            txt_files = sorted(self.src_folder.glob("*.txt"))
+            if not txt_files:
+                self.error.emit(f"txt 파일 없음: {self.src_folder}")
+                return
+
+            total = len(txt_files)
+            self.out_folder.mkdir(parents=True, exist_ok=True)
+            converted   = 0
+            skipped_sum = 0
+
+            for i, src_txt in enumerate(txt_files):
+                if self._stop:
+                    self.log.emit("중단됨.")
+                    return
+
+                out_txt = self.out_folder / src_txt.name
+                if not self.overwrite and out_txt.exists():
+                    self.progress.emit(i + 1, total)
+                    continue
+
+                lines = [l.strip() for l in src_txt.read_text(
+                    encoding="utf-8").splitlines() if l.strip()]
+                new_lines = []
+                skipped_here = 0
+
+                for line in lines:
+                    parts = line.split()
+                    if len(parts) != 5:
+                        new_lines.append(line)   # 형식 불명 → 그대로
+                        continue
+                    src_id = int(parts[0])
+                    rest   = " ".join(parts[1:])
+
+                    if src_id in self.remap:
+                        new_lines.append(f"{self.remap[src_id]} {rest}")
+                    else:
+                        if self.skip_unmatched:
+                            skipped_here += 1   # 제외
+                        else:
+                            new_lines.append(line)  # 원본 ID 유지
+
+                out_txt.write_text("\n".join(new_lines) + ("\n" if new_lines else ""),
+                                   encoding="utf-8")
+                skipped_sum += skipped_here
+                converted   += 1
+                self.progress.emit(i + 1, total)
+
+            self.log.emit(f"완료. txt {converted}개 변환  |  제외된 박스: {skipped_sum}개")
+            self.finished.emit(converted, skipped_sum)
+
+        except Exception:
+            import traceback
+            self.error.emit(traceback.format_exc())
+
+
+# ══════════════════════════════════════════════════════════════════════════════
 # 메인 윈도우
 # ══════════════════════════════════════════════════════════════════════════════
 class AutoLabelWindow(QMainWindow):
     def __init__(self):
         super().__init__()
-        self.worker = None
+        self.worker         = None
+        self.conv_worker    = None
         self._build_ui()
         self._refresh_model_combo()
 
     def _build_ui(self):
-        self.setWindowTitle("NeuralD Auto Labeler  —  1차 자동 라벨링")
-        self.resize(760, 580)
-        self.setMinimumSize(620, 460)
+        self.setWindowTitle("NeuralD Auto Labeler  —  자동 라벨링 / 클래스 변환")
+        self.resize(780, 640)
+        self.setMinimumSize(640, 500)
 
         central = QWidget()
         self.setCentralWidget(central)
-        layout = QVBoxLayout(central)
+        root = QVBoxLayout(central)
+        root.setContentsMargins(0, 0, 0, 0)
+
+        tabs = QTabWidget()
+        tabs.setDocumentMode(True)
+        root.addWidget(tabs)
+
+        # ── Tab 1: 자동 라벨링 ────────────────────────────────────────────
+        tab1 = QWidget()
+        tabs.addTab(tab1, "🤖  자동 라벨링")
+        layout = QVBoxLayout(tab1)
         layout.setContentsMargins(16, 12, 16, 12)
         layout.setSpacing(10)
 
@@ -379,11 +497,265 @@ class AutoLabelWindow(QMainWindow):
         # 출력 yaml 콤보 초기화
         self._refresh_target_yaml_combo()
 
+        # ── Tab 2: TXT 클래스 변환 ───────────────────────────────────────
+        tab2 = QWidget()
+        tabs.addTab(tab2, "🔄  클래스 변환")
+        self._build_convert_tab(tab2)
+
     # ── 섹션 레이블 헬퍼 ──────────────────────────────────────────────────
     def _section(self, text: str) -> QLabel:
         lbl = QLabel(text)
         lbl.setStyleSheet("font-weight:bold; color:#333; margin-top:4px;")
         return lbl
+
+    # ══════════════════════════════════════════════════════════════════════
+    # Tab 2: TXT 클래스 변환 UI
+    # ══════════════════════════════════════════════════════════════════════
+    def _build_convert_tab(self, parent: QWidget):
+        layout = QVBoxLayout(parent)
+        layout.setContentsMargins(16, 12, 16, 12)
+        layout.setSpacing(10)
+
+        layout.addWidget(self._section("소스 Config 폴더  (변환 전 클래스 기준 — obj.names 포함)"))
+        src_cfg_row = QHBoxLayout()
+        self.conv_src_cfg_edit = QLineEdit()
+        self.conv_src_cfg_edit.setPlaceholderText("예: /path/to/config_old/")
+        self.conv_src_cfg_edit.textChanged.connect(self._update_conv_preview)
+        src_cfg_row.addWidget(self.conv_src_cfg_edit)
+        btn_src_cfg = QPushButton("찾아보기...")
+        btn_src_cfg.setFixedWidth(90)
+        btn_src_cfg.clicked.connect(self._browse_conv_src_cfg)
+        src_cfg_row.addWidget(btn_src_cfg)
+        layout.addLayout(src_cfg_row)
+
+        layout.addWidget(self._section("대상 Config 폴더  (변환 후 클래스 기준 — obj.names 포함)"))
+        tgt_cfg_row = QHBoxLayout()
+        self.conv_tgt_cfg_edit = QLineEdit()
+        self.conv_tgt_cfg_edit.setPlaceholderText("예: /path/to/config/")
+        self.conv_tgt_cfg_edit.textChanged.connect(self._update_conv_preview)
+        tgt_cfg_row.addWidget(self.conv_tgt_cfg_edit)
+        btn_tgt_cfg = QPushButton("찾아보기...")
+        btn_tgt_cfg.setFixedWidth(90)
+        btn_tgt_cfg.clicked.connect(self._browse_conv_tgt_cfg)
+        tgt_cfg_row.addWidget(btn_tgt_cfg)
+        layout.addLayout(tgt_cfg_row)
+
+        # 클래스 매핑 미리보기
+        layout.addWidget(self._section("클래스 매핑 미리보기"))
+        self.conv_map_list = QListWidget()
+        self.conv_map_list.setMaximumHeight(140)
+        self.conv_map_list.setFont(QFont("Menlo", 10))
+        layout.addWidget(self.conv_map_list)
+
+        # 옵션
+        opt_row = QHBoxLayout()
+        self.chk_skip_unmatched = QCheckBox("매칭 안 되는 클래스 제외  (체크 해제 시 원본 ID 유지)")
+        self.chk_skip_unmatched.setChecked(True)
+        self.chk_conv_overwrite = QCheckBox("덮어쓰기  (체크 해제 시 기존 파일 건너뜀)")
+        self.chk_conv_overwrite.setChecked(True)
+        opt_row.addWidget(self.chk_skip_unmatched)
+        opt_row.addSpacing(20)
+        opt_row.addWidget(self.chk_conv_overwrite)
+        opt_row.addStretch()
+        layout.addLayout(opt_row)
+
+        layout.addWidget(self._section("TXT 소스 폴더  (변환할 .txt 파일들)"))
+        conv_src_row = QHBoxLayout()
+        self.conv_src_edit = QLineEdit()
+        self.conv_src_edit.setPlaceholderText("변환할 txt 파일이 있는 폴더")
+        conv_src_row.addWidget(self.conv_src_edit)
+        btn_conv_src = QPushButton("찾아보기...")
+        btn_conv_src.setFixedWidth(90)
+        btn_conv_src.clicked.connect(self._browse_conv_src)
+        conv_src_row.addWidget(btn_conv_src)
+        layout.addLayout(conv_src_row)
+
+        layout.addWidget(self._section("출력 폴더  (변환된 .txt 저장 위치)"))
+        conv_out_row = QHBoxLayout()
+        self.conv_out_edit = QLineEdit()
+        self.conv_out_edit.setPlaceholderText("변환 결과를 저장할 폴더 (소스 폴더와 동일하게 하면 덮어쓰기)")
+        conv_out_row.addWidget(self.conv_out_edit)
+        btn_conv_out = QPushButton("찾아보기...")
+        btn_conv_out.setFixedWidth(90)
+        btn_conv_out.clicked.connect(self._browse_conv_out)
+        conv_out_row.addWidget(btn_conv_out)
+        layout.addLayout(conv_out_row)
+
+        # 실행 버튼
+        conv_run_row = QHBoxLayout()
+        self.btn_conv_run = QPushButton("▶  변환 시작")
+        self.btn_conv_run.setFixedHeight(36)
+        self.btn_conv_run.setStyleSheet(
+            "QPushButton{background:#2e7d32;color:white;border-radius:5px;"
+            "font-weight:bold;font-size:13px;}"
+            "QPushButton:hover{background:#1b5e20;}"
+            "QPushButton:disabled{background:#aaa;}")
+        self.btn_conv_run.clicked.connect(self._conv_run)
+        conv_run_row.addWidget(self.btn_conv_run)
+
+        self.btn_conv_stop = QPushButton("■  중단")
+        self.btn_conv_stop.setFixedHeight(36)
+        self.btn_conv_stop.setFixedWidth(80)
+        self.btn_conv_stop.setEnabled(False)
+        self.btn_conv_stop.setStyleSheet(
+            "QPushButton{background:#c0392b;color:white;border-radius:5px;font-weight:bold;}"
+            "QPushButton:disabled{background:#aaa;}")
+        self.btn_conv_stop.clicked.connect(self._conv_stop)
+        conv_run_row.addWidget(self.btn_conv_stop)
+        layout.addLayout(conv_run_row)
+
+        self.conv_progress = QProgressBar()
+        self.conv_progress.setVisible(False)
+        self.conv_progress.setTextVisible(True)
+        layout.addWidget(self.conv_progress)
+
+        self.conv_log = QTextEdit()
+        self.conv_log.setReadOnly(True)
+        self.conv_log.setFont(QFont("Menlo", 10))
+        self.conv_log.setMaximumHeight(110)
+        layout.addWidget(self.conv_log)
+
+    # ── 변환 탭: config 폴더 선택 / 미리보기 ─────────────────────────────
+    def _browse_conv_src_cfg(self):
+        d = QFileDialog.getExistingDirectory(self, "소스 Config 폴더 선택",
+                                             str(SCRIPT_DIR))
+        if d:
+            self.conv_src_cfg_edit.setText(d)
+
+    def _browse_conv_tgt_cfg(self):
+        d = QFileDialog.getExistingDirectory(self, "대상 Config 폴더 선택",
+                                             str(SCRIPT_DIR))
+        if d:
+            self.conv_tgt_cfg_edit.setText(d)
+
+    def _browse_conv_src(self):
+        d = QFileDialog.getExistingDirectory(self, "TXT 소스 폴더 선택",
+                                             str(SCRIPT_DIR))
+        if d:
+            self.conv_src_edit.setText(d)
+            if not self.conv_out_edit.text().strip():
+                self.conv_out_edit.setText(d)
+
+    def _browse_conv_out(self):
+        d = QFileDialog.getExistingDirectory(self, "출력 폴더 선택",
+                                             str(SCRIPT_DIR))
+        if d:
+            self.conv_out_edit.setText(d)
+
+    def _update_conv_preview(self):
+        """소스/대상 config 경로가 모두 입력되면 매핑 미리보기 갱신."""
+        self.conv_map_list.clear()
+        src_p = self.conv_src_cfg_edit.text().strip()
+        tgt_p = self.conv_tgt_cfg_edit.text().strip()
+        if not src_p or not tgt_p:
+            return
+        try:
+            src_names = load_obj_names(Path(src_p))
+            tgt_names = load_obj_names(Path(tgt_p))
+            remap, skipped = build_config_remap(src_names, tgt_names)
+
+            for src_id, tgt_id in sorted(remap.items()):
+                name = src_names[src_id]
+                item = QListWidgetItem(f"  ✅  [{src_id}] {name}  →  [{tgt_id}] {tgt_names.get(tgt_id, '?')}")
+                item.setForeground(QColor("#1a7a1a"))
+                self.conv_map_list.addItem(item)
+
+            for src_id, name in skipped:
+                item = QListWidgetItem(f"  ⚠️  [{src_id}] {name}  →  대상 없음 (제외 또는 유지)")
+                item.setForeground(QColor("#c0392b"))
+                self.conv_map_list.addItem(item)
+
+            if not skipped:
+                sep = QListWidgetItem(f"  총 {len(remap)}개 클래스 매핑, 제외 없음")
+                sep.setForeground(QColor("#555"))
+                self.conv_map_list.addItem(sep)
+            else:
+                sep = QListWidgetItem(
+                    f"  총 {len(remap)}개 매핑  |  ⚠️ 제외 {len(skipped)}개")
+                sep.setForeground(QColor("#8a5a00"))
+                self.conv_map_list.addItem(sep)
+
+        except Exception as e:
+            item = QListWidgetItem(f"  ❌ {e}")
+            item.setForeground(QColor("#c0392b"))
+            self.conv_map_list.addItem(item)
+
+    # ── 변환 실행 / 중단 ──────────────────────────────────────────────────
+    def _conv_run(self):
+        src_cfg = self.conv_src_cfg_edit.text().strip()
+        tgt_cfg = self.conv_tgt_cfg_edit.text().strip()
+        src_txt = self.conv_src_edit.text().strip()
+        out_txt = self.conv_out_edit.text().strip()
+
+        if not src_cfg or not tgt_cfg:
+            self._conv_log("[오류] 소스/대상 Config 폴더를 먼저 선택하세요.")
+            return
+        if not src_txt:
+            self._conv_log("[오류] TXT 소스 폴더를 선택하세요.")
+            return
+        if not out_txt:
+            self._conv_log("[오류] 출력 폴더를 선택하세요.")
+            return
+
+        try:
+            src_names = load_obj_names(Path(src_cfg))
+            tgt_names = load_obj_names(Path(tgt_cfg))
+            remap, skipped = build_config_remap(src_names, tgt_names)
+        except Exception as e:
+            self._conv_log(f"[오류] config 로드 실패: {e}")
+            return
+
+        if not remap:
+            self._conv_log("[오류] 매핑 가능한 클래스가 없습니다. Config 폴더를 확인하세요.")
+            return
+
+        self._conv_log(f"소스 Config: {Path(src_cfg).name}  →  대상 Config: {Path(tgt_cfg).name}")
+        self._conv_log(f"매핑 {len(remap)}개  |  제외 {len(skipped)}개 클래스")
+        self._conv_log(f"TXT: {src_txt}  →  출력: {out_txt}")
+
+        self.btn_conv_run.setEnabled(False)
+        self.btn_conv_stop.setEnabled(True)
+        self.conv_progress.setVisible(True)
+        self.conv_progress.setValue(0)
+
+        self.conv_worker = ConvertWorker(
+            src_folder      = Path(src_txt),
+            out_folder      = Path(out_txt),
+            remap           = remap,
+            skip_unmatched  = self.chk_skip_unmatched.isChecked(),
+            overwrite       = self.chk_conv_overwrite.isChecked(),
+        )
+        self.conv_worker.progress.connect(self._conv_on_progress)
+        self.conv_worker.log.connect(self._conv_log)
+        self.conv_worker.finished.connect(self._conv_on_finished)
+        self.conv_worker.error.connect(self._conv_on_error)
+        self.conv_worker.start()
+
+    def _conv_stop(self):
+        if self.conv_worker:
+            self.conv_worker.stop()
+        self.btn_conv_stop.setEnabled(False)
+
+    def _conv_on_progress(self, cur: int, total: int):
+        self.conv_progress.setMaximum(total)
+        self.conv_progress.setValue(cur)
+        self.conv_progress.setFormat(f"{cur} / {total}  ({cur*100//total}%)")
+
+    def _conv_on_finished(self, converted: int, skipped_boxes: int):
+        self._conv_log(f"[완료] txt {converted}개 변환  |  제외된 박스: {skipped_boxes}개")
+        self.conv_progress.setValue(self.conv_progress.maximum())
+        self.btn_conv_run.setEnabled(True)
+        self.btn_conv_stop.setEnabled(False)
+
+    def _conv_on_error(self, msg: str):
+        self._conv_log(f"[오류]\n{msg}")
+        self.btn_conv_run.setEnabled(True)
+        self.btn_conv_stop.setEnabled(False)
+
+    def _conv_log(self, msg: str):
+        self.conv_log.append(msg)
+        self.conv_log.verticalScrollBar().setValue(
+            self.conv_log.verticalScrollBar().maximum())
 
     # ── 모델 콤보 초기화 ──────────────────────────────────────────────────
     def _refresh_model_combo(self):
