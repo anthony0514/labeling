@@ -25,7 +25,7 @@ from PyQt5.QtWidgets import (
     QApplication, QCheckBox, QFileDialog, QGroupBox, QHBoxLayout,
     QLabel, QListWidget, QListWidgetItem, QMainWindow, QPushButton,
     QSizePolicy, QSplitter, QVBoxLayout, QWidget, QScrollArea,
-    QSlider, QShortcut, QFrame, QTableWidget, QTableWidgetItem, QHeaderView
+    QSlider, QShortcut, QFrame
 )
 
 IMG_EXTS = {'.jpg', '.jpeg', '.png', '.bmp', '.webp'}
@@ -457,30 +457,57 @@ class MainWindow(QMainWindow):
         )
         rv.addWidget(self._info_bar)
 
-        # 클래스별 박스 개수 테이블
-        self._cls_table = QTableWidget(0, 5)
-        self._cls_table.setHorizontalHeaderLabels(["cls", "이름", "A", "B", "Δ"])
-        self._cls_table.setMaximumHeight(140)
-        self._cls_table.setMinimumHeight(60)
-        self._cls_table.setEditTriggers(QTableWidget.NoEditTriggers)
-        self._cls_table.setSelectionMode(QTableWidget.NoSelection)
-        self._cls_table.setFocusPolicy(Qt.NoFocus)
-        self._cls_table.verticalHeader().setVisible(False)
-        self._cls_table.setShowGrid(True)
-        self._cls_table.setStyleSheet(
-            "QTableWidget { background:#1a1a1a; color:#eee; "
-            "  gridline-color:#333; border:none; font-size:11px; }"
-            "QHeaderView::section { background:#2a2a2a; color:#aaa; "
-            "  padding:2px 4px; border:none; font-size:11px; }"
+        # 클래스별 박스 개수 리스트
+        cls_wrap = QFrame()
+        cls_wrap.setStyleSheet(
+            "QFrame { background:#181818; border:1px solid #333; border-radius:4px; }"
         )
-        hdr = self._cls_table.horizontalHeader()
-        hdr.setSectionResizeMode(0, QHeaderView.ResizeToContents)
-        hdr.setSectionResizeMode(1, QHeaderView.Stretch)
-        hdr.setSectionResizeMode(2, QHeaderView.ResizeToContents)
-        hdr.setSectionResizeMode(3, QHeaderView.ResizeToContents)
-        hdr.setSectionResizeMode(4, QHeaderView.ResizeToContents)
-        self._cls_table.verticalHeader().setDefaultSectionSize(20)
-        rv.addWidget(self._cls_table)
+        cls_wrap.setMaximumHeight(180)
+        cls_wrap.setMinimumHeight(52)
+        cls_wv = QVBoxLayout(cls_wrap)
+        cls_wv.setContentsMargins(0, 0, 0, 0)
+        cls_wv.setSpacing(0)
+
+        # 헤더 행
+        hdr_row = QFrame()
+        hdr_row.setFixedHeight(22)
+        hdr_row.setStyleSheet("background:#252525; border:none; border-bottom:1px solid #3a3a3a;")
+        hdr_h = QHBoxLayout(hdr_row)
+        hdr_h.setContentsMargins(6, 0, 6, 0)
+        hdr_h.setSpacing(0)
+        for txt, w, align in [
+            ("cls",  38,  Qt.AlignCenter),
+            ("클래스명", -1, Qt.AlignLeft | Qt.AlignVCenter),
+            ("A",    48,  Qt.AlignCenter),
+            ("B",    48,  Qt.AlignCenter),
+            ("Δ",    46,  Qt.AlignCenter),
+        ]:
+            lbl = QLabel(txt)
+            lbl.setStyleSheet("color:#888; font-size:10px; font-weight:bold; background:transparent;")
+            lbl.setAlignment(align)
+            if w > 0:
+                lbl.setFixedWidth(w)
+            else:
+                lbl.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Preferred)
+            hdr_h.addWidget(lbl)
+        cls_wv.addWidget(hdr_row)
+
+        # 스크롤 영역 (실제 행들)
+        cls_scroll = QScrollArea()
+        cls_scroll.setWidgetResizable(True)
+        cls_scroll.setFrameShape(QFrame.NoFrame)
+        cls_scroll.setHorizontalScrollBarPolicy(Qt.ScrollBarAlwaysOff)
+        cls_scroll.setStyleSheet("QScrollArea { background:transparent; border:none; }")
+        self._cls_rows_widget = QWidget()
+        self._cls_rows_widget.setStyleSheet("background:transparent;")
+        self._cls_rows_layout = QVBoxLayout(self._cls_rows_widget)
+        self._cls_rows_layout.setContentsMargins(0, 0, 0, 0)
+        self._cls_rows_layout.setSpacing(0)
+        self._cls_rows_layout.addStretch()
+        cls_scroll.setWidget(self._cls_rows_widget)
+        cls_wv.addWidget(cls_scroll)
+
+        rv.addWidget(cls_wrap)
 
         # 캔버스 스크롤
         scroll = QScrollArea()
@@ -664,7 +691,7 @@ class MainWindow(QMainWindow):
         )
         self._update_cls_table(matched, only_a, only_b)
 
-    # ── 클래스별 개수 테이블 ─────────────────────────────────────────────────
+    # ── 클래스별 개수 리스트 ─────────────────────────────────────────────────
 
     def _update_cls_table(
         self,
@@ -687,41 +714,78 @@ class MainWindow(QMainWindow):
 
         all_cls = sorted(set(cnt_a) | set(cnt_b))
 
-        tbl = self._cls_table
-        tbl.setRowCount(len(all_cls))
+        # 기존 행 위젯 전부 제거
+        layout = self._cls_rows_layout
+        while layout.count() > 1:          # 마지막 stretch 유지
+            item = layout.takeAt(0)
+            if item.widget():
+                item.widget().deleteLater()
 
-        for row, cls in enumerate(all_cls):
+        for idx, cls in enumerate(all_cls):
             a_cnt = cnt_a.get(cls, 0)
             b_cnt = cnt_b.get(cls, 0)
             delta = b_cnt - a_cnt
             name  = self._names_a.get(cls) or self._names_b.get(cls) or "?"
 
-            def _cell(text: str, align=Qt.AlignCenter) -> QTableWidgetItem:
-                item = QTableWidgetItem(text)
-                item.setTextAlignment(align)
-                return item
+            # 행 프레임 (짝/홀 배경 교대)
+            bg = "#1e1e1e" if idx % 2 == 0 else "#222222"
+            row_frame = QFrame()
+            row_frame.setFixedHeight(24)
+            row_frame.setStyleSheet(
+                f"QFrame {{ background:{bg}; border:none; }}"
+                f"QFrame:hover {{ background:#2a3a4a; }}"
+            )
+            rh = QHBoxLayout(row_frame)
+            rh.setContentsMargins(6, 0, 6, 0)
+            rh.setSpacing(0)
 
-            tbl.setItem(row, 0, _cell(str(cls)))
-            name_item = _cell(name, Qt.AlignLeft | Qt.AlignVCenter)
-            tbl.setItem(row, 1, name_item)
+            def lbl(text: str, color: str, width: int = -1,
+                    align=Qt.AlignCenter, bold=False) -> QLabel:
+                w = QLabel(text)
+                style = (f"color:{color}; font-size:12px; background:transparent;"
+                         + (" font-weight:bold;" if bold else ""))
+                w.setStyleSheet(style)
+                w.setAlignment(align)
+                if width > 0:
+                    w.setFixedWidth(width)
+                else:
+                    w.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Preferred)
+                return w
 
-            a_item = _cell(str(a_cnt))
-            a_item.setForeground(QColor("#FF7777") if a_cnt > 0 else QColor("#555"))
-            tbl.setItem(row, 2, a_item)
+            # [cls id]
+            rh.addWidget(lbl(f"[{cls}]", "#888888", width=38,
+                             align=Qt.AlignCenter))
 
-            b_item = _cell(str(b_cnt))
-            b_item.setForeground(QColor("#5599FF") if b_cnt > 0 else QColor("#555"))
-            tbl.setItem(row, 3, b_item)
+            # 클래스명
+            name_col = lbl(name, "#dddddd", align=Qt.AlignLeft | Qt.AlignVCenter,
+                           bold=(delta != 0))
+            rh.addWidget(name_col)
 
-            d_text  = f"{delta:+d}" if delta != 0 else "="
-            d_item  = _cell(d_text)
+            # 구분선
+            sep = QFrame()
+            sep.setFrameShape(QFrame.VLine)
+            sep.setStyleSheet("color:#333; background:#333;")
+            sep.setFixedWidth(1)
+            rh.addWidget(sep)
+
+            # A 개수
+            a_color = "#FF7777" if a_cnt > 0 else "#484848"
+            rh.addWidget(lbl(f"A  {a_cnt}", a_color, width=48))
+
+            # B 개수
+            b_color = "#5599FF" if b_cnt > 0 else "#484848"
+            rh.addWidget(lbl(f"B  {b_cnt}", b_color, width=48))
+
+            # 델타
             if delta == 0:
-                d_item.setForeground(QColor("#66BB66"))
+                d_text, d_color = "=", "#55AA55"
             elif delta > 0:
-                d_item.setForeground(QColor("#5599FF"))   # B 더 많음
+                d_text, d_color = f"+{delta}", "#5599FF"
             else:
-                d_item.setForeground(QColor("#FF7777"))   # A 더 많음
-            tbl.setItem(row, 4, d_item)
+                d_text, d_color = str(delta), "#FF7777"
+            rh.addWidget(lbl(d_text, d_color, width=46, bold=(delta != 0)))
+
+            layout.insertWidget(layout.count() - 1, row_frame)
 
     # ── 컨트롤 슬롯 ──────────────────────────────────────────────────────────
 
