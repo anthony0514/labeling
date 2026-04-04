@@ -903,12 +903,18 @@ class ReviewApp(QMainWindow):
         line2.setStyleSheet("color:#3a3a3a;")
         rv.addWidget(line2)
 
-        rv.addWidget(_section("📋 클래스 분포"))
-        self.info_dist = QLabel("—")
-        self.info_dist.setStyleSheet(
-            "padding:4px 6px; font-size:11px; color:#aaa;")
-        self.info_dist.setWordWrap(True)
-        rv.addWidget(self.info_dist)
+        rv.addWidget(_section("📋 클래스별 박스 수"))
+        self.cls_count_list = QListWidget()
+        self.cls_count_list.setMaximumHeight(160)
+        self.cls_count_list.setMinimumHeight(40)
+        self.cls_count_list.setFont(QFont("Courier New", 11))
+        self.cls_count_list.setFocusPolicy(Qt.NoFocus)
+        self.cls_count_list.setStyleSheet(
+            "QListWidget{background:#1a1a1a;border:1px solid #333;"
+            "border-radius:4px;outline:none;}"
+            "QListWidget::item{padding:2px 8px;}"
+            "QListWidget::item:selected{background:transparent;}")
+        rv.addWidget(self.cls_count_list)
 
         rv.addStretch()
         splitter.addWidget(right)
@@ -1235,9 +1241,15 @@ class ReviewApp(QMainWindow):
                 item.setBackground(QColor(9, 71, 113, 180))
             self.box_list.addItem(item)
 
-        # 클래스 분포
-        dist = get_class_dist(r["txt_path"], self.class_names)
-        self.info_dist.setText(dist if dist else "—")
+        # 클래스별 박스 수 (오름차순, 중복 없이)
+        self.cls_count_list.clear()
+        from collections import Counter
+        cnt = Counter(cls for cls, *_ in self.boxes)
+        for cls in sorted(cnt):
+            name = self.class_names[cls] if cls < len(self.class_names) else "?"
+            item = QListWidgetItem(f"[{cls:2d}]  {name:<16}  × {cnt[cls]}")
+            item.setForeground(get_color_for_class(cls))
+            self.cls_count_list.addItem(item)
 
     def _on_box_list_clicked(self, item):
         idx = item.data(Qt.UserRole)
