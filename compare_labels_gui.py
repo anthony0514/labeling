@@ -25,7 +25,7 @@ from PyQt5.QtWidgets import (
     QApplication, QCheckBox, QFileDialog, QGroupBox, QHBoxLayout,
     QLabel, QListWidget, QListWidgetItem, QMainWindow, QPushButton,
     QSizePolicy, QSplitter, QVBoxLayout, QWidget, QScrollArea,
-    QSlider, QShortcut, QFrame
+    QSlider, QShortcut, QFrame, QTableWidget, QTableWidgetItem, QHeaderView
 )
 
 IMG_EXTS = {'.jpg', '.jpeg', '.png', '.bmp', '.webp'}
@@ -457,6 +457,31 @@ class MainWindow(QMainWindow):
         )
         rv.addWidget(self._info_bar)
 
+        # 클래스별 박스 개수 테이블
+        self._cls_table = QTableWidget(0, 5)
+        self._cls_table.setHorizontalHeaderLabels(["cls", "이름", "A", "B", "Δ"])
+        self._cls_table.setMaximumHeight(140)
+        self._cls_table.setMinimumHeight(60)
+        self._cls_table.setEditTriggers(QTableWidget.NoEditTriggers)
+        self._cls_table.setSelectionMode(QTableWidget.NoSelection)
+        self._cls_table.setFocusPolicy(Qt.NoFocus)
+        self._cls_table.verticalHeader().setVisible(False)
+        self._cls_table.setShowGrid(True)
+        self._cls_table.setStyleSheet(
+            "QTableWidget { background:#1a1a1a; color:#eee; "
+            "  gridline-color:#333; border:none; font-size:11px; }"
+            "QHeaderView::section { background:#2a2a2a; color:#aaa; "
+            "  padding:2px 4px; border:none; font-size:11px; }"
+        )
+        hdr = self._cls_table.horizontalHeader()
+        hdr.setSectionResizeMode(0, QHeaderView.ResizeToContents)
+        hdr.setSectionResizeMode(1, QHeaderView.Stretch)
+        hdr.setSectionResizeMode(2, QHeaderView.ResizeToContents)
+        hdr.setSectionResizeMode(3, QHeaderView.ResizeToContents)
+        hdr.setSectionResizeMode(4, QHeaderView.ResizeToContents)
+        self._cls_table.verticalHeader().setDefaultSectionSize(20)
+        rv.addWidget(self._cls_table)
+
         # 캔버스 스크롤
         scroll = QScrollArea()
         scroll.setWidgetResizable(False)
@@ -637,6 +662,66 @@ class MainWindow(QMainWindow):
             f"총 차이: ±{d}    "
             f"{'⚠ 차이 있음' if d > 0 else '✓ 동일'}"
         )
+        self._update_cls_table(matched, only_a, only_b)
+
+    # ── 클래스별 개수 테이블 ─────────────────────────────────────────────────
+
+    def _update_cls_table(
+        self,
+        matched: list[tuple[Box, Box]],
+        only_a:  list[Box],
+        only_b:  list[Box],
+    ):
+        from collections import defaultdict
+
+        cnt_a: dict[int, int] = defaultdict(int)
+        cnt_b: dict[int, int] = defaultdict(int)
+
+        for ba, bb in matched:
+            cnt_a[ba.cls] += 1
+            cnt_b[bb.cls] += 1
+        for b in only_a:
+            cnt_a[b.cls] += 1
+        for b in only_b:
+            cnt_b[b.cls] += 1
+
+        all_cls = sorted(set(cnt_a) | set(cnt_b))
+
+        tbl = self._cls_table
+        tbl.setRowCount(len(all_cls))
+
+        for row, cls in enumerate(all_cls):
+            a_cnt = cnt_a.get(cls, 0)
+            b_cnt = cnt_b.get(cls, 0)
+            delta = b_cnt - a_cnt
+            name  = self._names_a.get(cls) or self._names_b.get(cls) or "?"
+
+            def _cell(text: str, align=Qt.AlignCenter) -> QTableWidgetItem:
+                item = QTableWidgetItem(text)
+                item.setTextAlignment(align)
+                return item
+
+            tbl.setItem(row, 0, _cell(str(cls)))
+            name_item = _cell(name, Qt.AlignLeft | Qt.AlignVCenter)
+            tbl.setItem(row, 1, name_item)
+
+            a_item = _cell(str(a_cnt))
+            a_item.setForeground(QColor("#FF7777") if a_cnt > 0 else QColor("#555"))
+            tbl.setItem(row, 2, a_item)
+
+            b_item = _cell(str(b_cnt))
+            b_item.setForeground(QColor("#5599FF") if b_cnt > 0 else QColor("#555"))
+            tbl.setItem(row, 3, b_item)
+
+            d_text  = f"{delta:+d}" if delta != 0 else "="
+            d_item  = _cell(d_text)
+            if delta == 0:
+                d_item.setForeground(QColor("#66BB66"))
+            elif delta > 0:
+                d_item.setForeground(QColor("#5599FF"))   # B 더 많음
+            else:
+                d_item.setForeground(QColor("#FF7777"))   # A 더 많음
+            tbl.setItem(row, 4, d_item)
 
     # ── 컨트롤 슬롯 ──────────────────────────────────────────────────────────
 
