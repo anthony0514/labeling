@@ -8,6 +8,7 @@
 import sys
 import pickle
 import time
+import zipfile
 from pathlib import Path
 
 import cv2
@@ -28,7 +29,7 @@ from PyQt5.QtWidgets import (
     QApplication, QMainWindow, QWidget, QVBoxLayout, QHBoxLayout,
     QPushButton, QLabel, QFileDialog, QProgressBar, QMessageBox,
     QSlider, QSizePolicy, QListWidget, QListWidgetItem, QSplitter,
-    QComboBox, QCheckBox, QScrollArea, QFrame
+    QComboBox, QCheckBox, QScrollArea, QFrame, QLineEdit
 )
 from PyQt5.QtGui import (
     QPixmap, QImage, QColor, QPainter, QPen, QBrush, QCursor, QFont
@@ -154,6 +155,20 @@ def get_class_dist(txt_path: Path, class_names: list) -> str:
 def find_config_dirs() -> list:
     return sorted([p for p in SCRIPT_DIR.iterdir()
                    if p.is_dir() and p.name.startswith("config")])
+
+
+def get_class_ids(txt_path: Path) -> set:
+    """txt 파일에서 클래스 ID 집합 반환."""
+    ids = set()
+    if txt_path.exists():
+        for line in txt_path.read_text().strip().splitlines():
+            parts = line.split()
+            if len(parts) == 5:
+                try:
+                    ids.add(int(parts[0]))
+                except ValueError:
+                    pass
+    return ids
 
 
 def get_color_for_class(cls: int) -> QColor:
@@ -357,6 +372,36 @@ def _to_cleanlab_preds(raw_preds: list, num_classes: int):
 
 
 # ══════════════════════════════════════════════════════════════════════════════
+# TXT 압축 워커
+# ══════════════════════════════════════════════════════════════════════════════
+class ZipWorker(QThread):
+    progress = pyqtSignal(int, int)
+    finished = pyqtSignal(str, int)   # (zip 경로, 파일 수)
+    error    = pyqtSignal(str)
+
+    def __init__(self, src_folder: Path, zip_path: Path):
+        super().__init__()
+        self.src_folder = src_folder
+        self.zip_path   = zip_path
+
+    def run(self):
+        try:
+            txt_files = sorted(self.src_folder.glob("*.txt"))
+            if not txt_files:
+                self.error.emit("폴더 내에 .txt 파일이 없습니다.")
+                return
+            total = len(txt_files)
+            with zipfile.ZipFile(self.zip_path, "w", zipfile.ZIP_DEFLATED) as zf:
+                for i, f in enumerate(txt_files, 1):
+                    zf.write(f, f.name)
+                    self.progress.emit(i, total)
+            self.finished.emit(str(self.zip_path), total)
+        except Exception:
+            import traceback
+            self.error.emit(traceback.format_exc())
+
+
+# ══════════════════════════════════════════════════════════════════════════════
 # 검수 워커 (원본 유지)
 # ══════════════════════════════════════════════════════════════════════════════
 class ReviewWorker(QThread):
@@ -480,6 +525,7 @@ class ReviewApp(QMainWindow):
         self.current_config_dir= CONFIG_DIR
         self._num_classes      = load_class_count(CONFIG_DIR)
         self._sort_key         = "score_asc"   # 현재 정렬 기준
+        self._filter_classes: set = set()      # 클래스 ID 필터 (빈 set = 전체 표시)
 
         # ── ImageReviewWindow 상태 ───────────────────────────────────────────
         self.cur_idx           = 0
@@ -528,7 +574,7 @@ class ReviewApp(QMainWindow):
 
         # ── 상단 툴바 ────────────────────────────────────────────────────────
         tb = QWidget()
-        tb.setFixedHeight(72)
+        tb.setFixedHeight(100)
         tb.setStyleSheet("background:#252526; border-bottom:1px solid #3a3a3a;")
         tb_layout = QVBoxLayout(tb)
         tb_layout.setContentsMargins(8, 4, 8, 4)
@@ -618,6 +664,29 @@ class ReviewApp(QMainWindow):
         row2.addWidget(self.progress_bar)
         row2.addStretch()
         tb_layout.addLayout(row2)
+
+        # ── row3: TXT 압축 ───────────────────────────────────────────────────
+        sep = QWidget(); sep.setFixedHeight(1)
+        sep.setStyleSheet("background:#3a3a3a;")
+        tb_layout.addWidget(sep)
+
+        row3 = QHBoxLayout(); row3.setSpacing(6)
+        zip_lbl = QLabel("📦 TXT 압축:")
+        zip_lbl.setStyleSheet("color:#aaa; font-size:11px;")
+        self.zip_name_edit = QLineEdit()
+        self.zip_name_edit.setPlaceholderText("파일명 (폴더 선택 시 자동 입력)")
+        self.zip_name_edit.setFixedHeight(22)
+        self.zip_name_edit.setStyleSheet(
+            "background:#1e1e1e; color:#dcdcdc; border:1px solid #3a3a3a;"
+            "border-radius:3px; padding:1px 6px; font-size:11px;")
+        self.btn_zip_txt = _btn("압축 시작", "#5a3e8a", height=22)
+        self.btn_zip_txt.setEnabled(False)
+        self.btn_zip_txt.clicked.connect(self._zip_txt)
+        row3.addWidget(zip_lbl)
+        row3.addWidget(self.zip_name_edit)
+        row3.addWidget(self.btn_zip_txt)
+        tb_layout.addLayout(row3)
+
         root.addWidget(tb)
 
         # ── 3분할 스플리터 ────────────────────────────────────────────────────
@@ -646,6 +715,69 @@ class ReviewApp(QMainWindow):
         sort_row.addWidget(sort_lbl)
         sort_row.addWidget(self.sort_combo)
         lv.addLayout(sort_row)
+
+        # ── 클래스 필터 ──────────────────────────────────────────────────────
+        filter_hdr = QHBoxLayout()
+        filter_ttl = QLabel("🔍 클래스 필터")
+        filter_ttl.setStyleSheet("color:#bbb; font-size:11px; font-weight:bold;")
+        self.btn_clear_filter = QPushButton("초기화")
+        self.btn_clear_filter.setFixedHeight(20)
+        self.btn_clear_filter.setFixedWidth(48)
+        self.btn_clear_filter.setStyleSheet(
+            "QPushButton{background:#3a3a3a;color:#aaa;border:1px solid #555;"
+            "border-radius:3px;font-size:10px;padding:0;}"
+            "QPushButton:hover{background:#555;color:#fff;}")
+        self.btn_clear_filter.clicked.connect(self._clear_filter)
+        filter_hdr.addWidget(filter_ttl)
+        filter_hdr.addStretch()
+        filter_hdr.addWidget(self.btn_clear_filter)
+        lv.addLayout(filter_hdr)
+
+        filter_input_row = QHBoxLayout()
+        filter_input_row.setSpacing(3)
+        self.filter_input = QLineEdit()
+        self.filter_input.setPlaceholderText("클래스 ID (예: 0)")
+        self.filter_input.setFixedHeight(22)
+        self.filter_input.setStyleSheet(
+            "QLineEdit{background:#2a2a2a;color:#dcdcdc;border:1px solid #555;"
+            "border-radius:3px;padding:1px 4px;font-size:11px;}")
+        self.filter_input.returnPressed.connect(self._add_filter_class)
+        btn_add_filter = QPushButton("추가")
+        btn_add_filter.setFixedHeight(22)
+        btn_add_filter.setFixedWidth(38)
+        btn_add_filter.setStyleSheet(
+            "QPushButton{background:#0e639c;color:#fff;border:none;"
+            "border-radius:3px;font-size:11px;}"
+            "QPushButton:hover{background:#1177bb;}")
+        btn_add_filter.clicked.connect(self._add_filter_class)
+        filter_input_row.addWidget(self.filter_input)
+        filter_input_row.addWidget(btn_add_filter)
+        lv.addLayout(filter_input_row)
+
+        # 활성 필터 태그 목록 (더블클릭 → 제거)
+        self.filter_tag_list = QListWidget()
+        self.filter_tag_list.setMaximumHeight(88)
+        self.filter_tag_list.setStyleSheet(
+            "QListWidget{background:#1e1e1e;border:1px solid #3a3a3a;"
+            "font-size:11px;}"
+            "QListWidget::item{padding:2px 4px;border-bottom:1px solid #2a2a2a;}"
+            "QListWidget::item:selected{background:#094771;}"
+            "QListWidget::item:hover{background:#2a2d2e;}")
+        self.filter_tag_list.itemDoubleClicked.connect(self._remove_filter_item)
+        self.filter_tag_list.setVisible(False)
+        lv.addWidget(self.filter_tag_list)
+
+        self.filter_count_label = QLabel("")
+        self.filter_count_label.setStyleSheet(
+            "color:#569cd6; font-size:10px; padding:0 2px;")
+        self.filter_count_label.setVisible(False)
+        lv.addWidget(self.filter_count_label)
+
+        # 구분선
+        sep = QFrame()
+        sep.setFrameShape(QFrame.HLine)
+        sep.setStyleSheet("color:#3a3a3a;")
+        lv.addWidget(sep)
 
         self.file_list = QListWidget()
         self.file_list.setSelectionMode(QListWidget.SingleSelection)
@@ -832,7 +964,15 @@ class ReviewApp(QMainWindow):
     def _populate_list(self):
         self.file_list.blockSignals(True)
         self.file_list.clear()
+        visible_count = 0
         for i, r in enumerate(self.results):
+            # ── 클래스 필터 적용 ──────────────────────────────────────────
+            if self._filter_classes:
+                if "class_ids" not in r:
+                    r["class_ids"] = get_class_ids(r["txt_path"])
+                if not self._filter_classes.issubset(r["class_ids"]):
+                    continue   # 필터 클래스 모두 포함하지 않는 이미지 제외
+
             score     = r["score"]
             confirmed = r.get("confirmed", False)
             is_issue  = r["is_issue"]
@@ -847,7 +987,7 @@ class ReviewApp(QMainWindow):
             text = f"{icon}{dup} {name}\n      점수: {sc}"
 
             item = QListWidgetItem(text)
-            item.setData(Qt.UserRole, i)
+            item.setData(Qt.UserRole, i)   # results 인덱스 저장
 
             if confirmed:
                 item.setForeground(QColor("#4ec94e"))
@@ -863,15 +1003,29 @@ class ReviewApp(QMainWindow):
                 item.setBackground(QColor(20, 60, 20, 80))
 
             self.file_list.addItem(item)
+            visible_count += 1
+
         self.file_list.blockSignals(False)
+
+        # 필터 카운트 라벨 갱신
+        if self._filter_classes:
+            self.filter_count_label.setText(
+                f"  {visible_count} / {len(self.results)}개 이미지 표시중")
+            self.filter_count_label.setVisible(True)
+        else:
+            self.filter_count_label.setVisible(False)
 
     def _update_list_selection(self):
         if not self.results:
             return
         self.file_list.blockSignals(True)
-        self.file_list.setCurrentRow(self.cur_idx)
-        self.file_list.scrollToItem(self.file_list.item(self.cur_idx),
-                                    QListWidget.PositionAtCenter)
+        # UserRole로 현재 cur_idx에 해당하는 행 검색
+        for row in range(self.file_list.count()):
+            item = self.file_list.item(row)
+            if item and item.data(Qt.UserRole) == self.cur_idx:
+                self.file_list.setCurrentRow(row)
+                self.file_list.scrollToItem(item, QListWidget.PositionAtCenter)
+                break
         self.file_list.blockSignals(False)
 
     def _on_list_item_clicked(self, item):
@@ -933,21 +1087,86 @@ class ReviewApp(QMainWindow):
         # 목록 항목 아이콘 갱신 (로드 후 dup 계산 완료)
         self._refresh_list_item(idx)
 
-    def _navigate_prev(self):
-        if self.cur_idx > 0:
-            self.save_labels()
-            self._load_image_at(self.cur_idx - 1)
+    def _current_list_row(self) -> int:
+        """현재 cur_idx 에 해당하는 file_list 행 번호 반환 (-1 = 없음)."""
+        for row in range(self.file_list.count()):
+            item = self.file_list.item(row)
+            if item and item.data(Qt.UserRole) == self.cur_idx:
+                return row
+        return -1
 
-    def _navigate_next(self):
-        if self.results and self.cur_idx < len(self.results) - 1:
+    def _navigate_prev(self):
+        row = self._current_list_row()
+        if row > 0:
             self.save_labels()
-            self._load_image_at(self.cur_idx + 1)
+            prev_idx = self.file_list.item(row - 1).data(Qt.UserRole)
+            self._load_image_at(prev_idx)
         elif self.results:
             self.save_labels()
 
+    def _navigate_next(self):
+        row = self._current_list_row()
+        if row >= 0 and row < self.file_list.count() - 1:
+            self.save_labels()
+            next_idx = self.file_list.item(row + 1).data(Qt.UserRole)
+            self._load_image_at(next_idx)
+        elif self.results:
+            self.save_labels()
+
+    # ── 클래스 필터 메서드 ──────────────────────────────────────────────────
+    def _add_filter_class(self):
+        text = self.filter_input.text().strip()
+        if not text:
+            return
+        try:
+            cls_id = int(text)
+        except ValueError:
+            return
+        self._filter_classes.add(cls_id)
+        self.filter_input.clear()
+        self._refresh_filter_ui()
+        self._apply_filter_and_reload()
+
+    def _remove_filter_item(self, item):
+        cls_id = item.data(Qt.UserRole)
+        self._filter_classes.discard(cls_id)
+        self._refresh_filter_ui()
+        self._apply_filter_and_reload()
+
+    def _clear_filter(self):
+        self._filter_classes.clear()
+        self._refresh_filter_ui()
+        self._populate_list()
+        self._update_list_selection()
+
+    def _refresh_filter_ui(self):
+        self.filter_tag_list.clear()
+        for cls_id in sorted(self._filter_classes):
+            name = self.class_names[cls_id] if cls_id < len(self.class_names) else ""
+            label = f"[{cls_id}] {name}  ✕ 더블클릭 제거" if name else f"[{cls_id}]  ✕ 더블클릭 제거"
+            item = QListWidgetItem(label)
+            item.setData(Qt.UserRole, cls_id)
+            item.setForeground(get_color_for_class(cls_id))
+            self.filter_tag_list.addItem(item)
+        has = bool(self._filter_classes)
+        self.filter_tag_list.setVisible(has)
+        self.filter_count_label.setVisible(has)
+
+    def _apply_filter_and_reload(self):
+        self._populate_list()
+        if self.file_list.count() == 0:
+            return
+        cur_visible = self._current_list_row()
+        if cur_visible < 0:
+            first_idx = self.file_list.item(0).data(Qt.UserRole)
+            self._load_image_at(first_idx)
+        else:
+            self._update_list_selection()
+
+    # ── 목록 항목 갱신 ──────────────────────────────────────────────────────
     def _refresh_list_item(self, idx: int):
-        """목록의 단일 항목 아이콘/색상 재갱신."""
-        if idx < 0 or idx >= self.file_list.count():
+        """목록의 단일 항목 아이콘/색상 재갱신 (UserRole로 행 검색)."""
+        if idx < 0 or idx >= len(self.results):
             return
         r = self.results[idx]
         score     = r["score"]
@@ -960,19 +1179,25 @@ class ReviewApp(QMainWindow):
         if len(name) > 22:
             name = name[:19] + "..."
         text = f"{icon}{dup} {name}\n      점수: {score:.3f}"
-        item = self.file_list.item(idx)
-        if item:
+        # 필터 적용 시 list widget 행 번호 ≠ results 인덱스 → UserRole로 검색
+        target_item = None
+        for row in range(self.file_list.count()):
+            it = self.file_list.item(row)
+            if it and it.data(Qt.UserRole) == idx:
+                target_item = it
+                break
+        if target_item:
             self.file_list.blockSignals(True)
-            item.setText(text)
+            target_item.setText(text)
             if confirmed:
-                item.setForeground(QColor("#4ec94e"))
-                item.setBackground(QColor(20, 60, 20, 80))
+                target_item.setForeground(QColor("#4ec94e"))
+                target_item.setBackground(QColor(20, 60, 20, 80))
             elif is_issue:
-                item.setForeground(QColor("#e07070") if score < 0.5 else QColor("#e0a070"))
-                item.setBackground(QColor(80, 20, 20, 80) if score < 0.5 else QColor())
+                target_item.setForeground(QColor("#e07070") if score < 0.5 else QColor("#e0a070"))
+                target_item.setBackground(QColor(80, 20, 20, 80) if score < 0.5 else QColor())
             else:
-                item.setForeground(QColor("#dcdcdc"))
-                item.setBackground(QColor())
+                target_item.setForeground(QColor("#dcdcdc"))
+                target_item.setBackground(QColor())
             self.file_list.blockSignals(False)
 
     # ══════════════════════════════════════════════════════════════════════════
@@ -1040,6 +1265,7 @@ class ReviewApp(QMainWindow):
                 f.write(f"{cls} {xc:.8f} {yc:.8f} {bw:.8f} {bh:.8f}\n")
         r["box_count"] = len(self.boxes)
         r["has_duplicate"] = compute_has_duplicate(path)
+        r.pop("class_ids", None)   # 클래스 변경 가능 → 캐시 무효화
         print(f"✅ 저장: {path.name}")
 
     def _serialize_state(self):
@@ -1728,6 +1954,8 @@ class ReviewApp(QMainWindow):
             "padding:3px 8px; border:1px solid #3a3a3a; border-radius:4px;"
             "background:#1e1e1e; color:#dcdcdc;")
         self.btn_review.setEnabled(True)
+        self.btn_zip_txt.setEnabled(True)
+        self.zip_name_edit.setText(self.selected_folder.name)
         self.results = []
         self.file_list.clear()
         self.summary_label.setText("")
@@ -1748,6 +1976,37 @@ class ReviewApp(QMainWindow):
             self.btn_unconfirm_all.setEnabled(False)
             self.btn_remove_dups.setEnabled(False)
             self.status_label.setText(f"캐시 없음 ({msg}). '전부 검수' 클릭")
+
+    def _zip_txt(self):
+        if not self.selected_folder:
+            return
+        name = self.zip_name_edit.text().strip() or self.selected_folder.name
+        if not name.endswith(".zip"):
+            name += ".zip"
+        zip_path = self.selected_folder.parent / name
+        self.btn_zip_txt.setEnabled(False)
+        self.progress_bar.setVisible(True)
+        self.progress_bar.setValue(0)
+        self.status_label.setText("txt 압축 중...")
+        self._zip_worker = ZipWorker(self.selected_folder, zip_path)
+        self._zip_worker.progress.connect(lambda c, t: (
+            self.progress_bar.setMaximum(t),
+            self.progress_bar.setValue(c),
+            self.progress_bar.setFormat(f"{c}/{t}"),
+        ))
+        self._zip_worker.finished.connect(self._zip_on_finished)
+        self._zip_worker.error.connect(self._zip_on_error)
+        self._zip_worker.start()
+
+    def _zip_on_finished(self, zip_path: str, count: int):
+        self.progress_bar.setVisible(False)
+        self.btn_zip_txt.setEnabled(True)
+        self.status_label.setText(f"압축 완료: {Path(zip_path).name}  ({count}개)")
+
+    def _zip_on_error(self, msg: str):
+        self.progress_bar.setVisible(False)
+        self.btn_zip_txt.setEnabled(True)
+        self.status_label.setText(f"압축 오류: {msg.splitlines()[-1]}")
 
     def _get_modified_files(self) -> set:
         if not self.selected_folder:
@@ -1868,7 +2127,9 @@ class ReviewApp(QMainWindow):
         self.status_label.setText("완료. 목록 클릭 → 이미지 편집")
 
         if self.results:
-            self._load_image_at(0)
+            if self.file_list.count() > 0:
+                first_idx = self.file_list.item(0).data(Qt.UserRole)
+                self._load_image_at(first_idx)
 
     def _on_partial_finished(self, new_results: list):
         self.progress_bar.setVisible(False)

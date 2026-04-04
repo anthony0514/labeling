@@ -204,6 +204,7 @@ class ImageCanvas(QLabel):
         self._names:       List[str]            = []
         self._hover_gid:   int                  = -1
         self._sel_gid:     int                  = -1
+        self._hidden:      set                  = set()   # 'A', 'B' 숨김
 
         # 렌더 캐시
         self._disp_rect = QRectF()
@@ -220,6 +221,11 @@ class ImageCanvas(QLabel):
 
     def refresh_boxes(self, boxes: List[Box]):
         self._boxes = boxes
+        self._paint()
+
+    def set_hidden(self, sources: set):
+        """숨길 소스 집합 설정. 예: {'A'} or {'B'} or set()"""
+        self._hidden = sources
         self._paint()
 
     def set_highlight(self, gid: int):
@@ -251,6 +257,8 @@ class ImageCanvas(QLabel):
         p.drawPixmap(ox, oy, QPixmap.fromImage(qimg))
 
         for box in self._boxes:
+            if box.source in self._hidden:
+                continue
             self._draw_box(p, box, dw, dh, ox, oy)
         p.end()
         self.setPixmap(canvas)
@@ -290,7 +298,7 @@ class ImageCanvas(QLabel):
         name = (self._names[box.cls]
                 if box.cls < len(self._names) else str(box.cls))
         src_tag = {'A': 'A', 'B': 'B', 'M': '⊕'}.get(box.source, box.source)
-        tag = f"[{src_tag}] {name}"
+        tag = f"[{src_tag}] {box.cls}:{name}"
         if not box.included:
             tag += "  ✗"
 
@@ -318,6 +326,8 @@ class ImageCanvas(QLabel):
         dw, dh = self._disp_rect.width(), self._disp_rect.height()
         ox, oy = self._disp_rect.x(), self._disp_rect.y()
         for box in reversed(self._boxes):
+            if box.source in self._hidden:
+                continue
             rx1 = (box.cx - box.w / 2) * dw + ox
             ry1 = (box.cy - box.h / 2) * dh + oy
             rx2 = (box.cx + box.w / 2) * dw + ox
@@ -385,7 +395,8 @@ class ConflictPanel(QWidget):
         seen: set[tuple] = set()
 
         def _name(b: Box) -> str:
-            return names[b.cls] if b.cls < len(names) else str(b.cls)
+            n = names[b.cls] if b.cls < len(names) else "?"
+            return f"{b.cls}:{n}"
 
         def _add(lst: QListWidget, label: str, color: str, gid: int):
             item = QListWidgetItem(label)
@@ -435,13 +446,16 @@ class MergeTool(QMainWindow):
         self.resize(1360, 820)
         self.setStyleSheet(DARK)
 
-        self._folder_a: Optional[Path] = None
-        self._folder_b: Optional[Path] = None
+        self._folder_a:   Optional[Path] = None
+        self._folder_b:   Optional[Path] = None
         self._folder_out: Optional[Path] = None
+        self._folder_img: Optional[Path] = None   # 별도 이미지 폴더 (선택)
         self._stems:  List[str] = []
         self._cur_stem: Optional[str] = None
         self._boxes:  List[Box] = []
         self._names:  List[str] = []
+        self._show_a: bool = True
+        self._show_b: bool = True
 
         self._build_ui()
         self._try_load_names()
@@ -504,11 +518,12 @@ class MergeTool(QMainWindow):
         row = QHBoxLayout()
         row.setSpacing(6)
 
-        # 폴더 3개
+        # 폴더 4개
         for title, color, which in [
-            ("A 폴더", "#00C851", 'A'),
-            ("B 폴더", "#1E82FF", 'B'),
-            ("출력 폴더", "#FF8800", 'out'),
+            ("A 폴더",    "#00C851", 'A'),
+            ("B 폴더",    "#1E82FF", 'B'),
+            ("이미지 폴더", "#aaaaaa", 'img'),
+            ("출력 폴더",  "#FF8800", 'out'),
         ]:
             grp = QGroupBox(title)
             grp.setStyleSheet(
@@ -607,6 +622,35 @@ class MergeTool(QMainWindow):
             b = QPushButton(text)
             b.clicked.connect(cb)
             row.addWidget(b)
+
+        row.addSpacing(12)
+
+        # A 토글
+        self._btn_toggle_a = QPushButton("A 표시  (0)")
+        self._btn_toggle_a.setCheckable(True)
+        self._btn_toggle_a.setChecked(True)
+        self._btn_toggle_a.setFixedHeight(26)
+        self._btn_toggle_a.setStyleSheet(
+            "QPushButton{background:#1a6e30; color:#eee; border-radius:3px;"
+            "border:1px solid #00C851; padding:2px 8px; font-size:12px;}"
+            "QPushButton:hover{background:#24a044;}"
+            "QPushButton:!checked{background:#2a2a2a; color:#555; border-color:#444;}")
+        self._btn_toggle_a.clicked.connect(self._toggle_a)
+        row.addWidget(self._btn_toggle_a)
+
+        # B 토글
+        self._btn_toggle_b = QPushButton("B 표시  (0)")
+        self._btn_toggle_b.setCheckable(True)
+        self._btn_toggle_b.setChecked(True)
+        self._btn_toggle_b.setFixedHeight(26)
+        self._btn_toggle_b.setStyleSheet(
+            "QPushButton{background:#0e3d7a; color:#eee; border-radius:3px;"
+            "border:1px solid #1E82FF; padding:2px 8px; font-size:12px;}"
+            "QPushButton:hover{background:#1558b0;}"
+            "QPushButton:!checked{background:#2a2a2a; color:#555; border-color:#444;}")
+        self._btn_toggle_b.clicked.connect(self._toggle_b)
+        row.addWidget(self._btn_toggle_b)
+
         row.addStretch()
 
         for text, cb in [
@@ -641,6 +685,8 @@ class MergeTool(QMainWindow):
             self._folder_a = p
         elif which == 'B':
             self._folder_b = p
+        elif which == 'img':
+            self._folder_img = p
         else:
             self._folder_out = p
         if self._folder_a and self._folder_b:
@@ -649,9 +695,9 @@ class MergeTool(QMainWindow):
     # ── 이미지 목록 구성 ──────────────────────────────────────────────
     def _build_list(self):
         sa = {p.stem for p in self._folder_a.iterdir()
-              if p.suffix.lower() in IMG_EXTS}
+              if p.suffix.lower() in IMG_EXTS or p.suffix == '.txt'}
         sb = {p.stem for p in self._folder_b.iterdir()
-              if p.suffix.lower() in IMG_EXTS}
+              if p.suffix.lower() in IMG_EXTS or p.suffix == '.txt'}
         self._stems = sorted(sa | sb)
 
         self._img_list.blockSignals(True)
@@ -679,9 +725,9 @@ class MergeTool(QMainWindow):
     def _load(self, stem: str):
         self._cur_stem = stem
 
-        # 이미지
+        # 이미지 — 이미지 폴더 우선, 없으면 A/B 폴더에서 탐색
         img = None
-        for folder in (self._folder_a, self._folder_b):
+        for folder in (self._folder_img, self._folder_a, self._folder_b):
             if folder:
                 p = find_image(folder, stem)
                 if p:
@@ -698,7 +744,9 @@ class MergeTool(QMainWindow):
                             self._sp_dup.value())
 
         self._canvas.load(img, self._boxes, self._names)
+        self._apply_visibility()
         self._cpanel.update(self._boxes, self._names)
+        self._update_toggle_counts()
 
         n_conf = len({tuple(sorted([b.gid, b.conflict_idx]))
                       for b in self._boxes
@@ -707,6 +755,29 @@ class MergeTool(QMainWindow):
         self._sb.showMessage(
             f"{stem}  │  A:{len(boxes_a)}개  B:{len(boxes_b)}개  "
             f"충돌:{n_conf}쌍  중복(자동제거):{n_dup}개")
+
+    # ── A / B 토글 ───────────────────────────────────────────────────
+    def _toggle_a(self):
+        self._show_a = self._btn_toggle_a.isChecked()
+        self._apply_visibility()
+
+    def _toggle_b(self):
+        self._show_b = self._btn_toggle_b.isChecked()
+        self._apply_visibility()
+
+    def _apply_visibility(self):
+        hidden = set()
+        if not self._show_a:
+            hidden.add('A')
+        if not self._show_b:
+            hidden.add('B')
+        self._canvas.set_hidden(hidden)
+
+    def _update_toggle_counts(self):
+        n_a = sum(1 for b in self._boxes if b.source == 'A')
+        n_b = sum(1 for b in self._boxes if b.source == 'B')
+        self._btn_toggle_a.setText(f"A 표시  ({n_a})")
+        self._btn_toggle_b.setText(f"B 표시  ({n_b})")
 
     # ── 박스 인터랙션 ─────────────────────────────────────────────────
     def _on_toggled(self, gid: int):

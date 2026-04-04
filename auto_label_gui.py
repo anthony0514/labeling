@@ -119,6 +119,63 @@ def load_obj_names(config_dir: Path) -> dict:
     return {i: name for i, name in enumerate(lines)}
 
 
+def refs_info(config_dir: Path) -> str:
+    """config/refs/ 폴더의 이미지 개수를 요약 문자열로 반환."""
+    refs_dir = config_dir / "refs"
+    if not refs_dir.exists():
+        return "refs 폴더 없음"
+    imgs = [f for f in refs_dir.iterdir() if f.suffix.lower() in IMG_EXTS]
+    return f"refs 이미지 {len(imgs)}개"
+
+
+def update_refs_folder(src_cfg: Path, tgt_cfg: Path, remap: dict) -> tuple:
+    """소스 config의 refs 이미지를 remap에 따라 대상 config의 refs 폴더에 복사/갱신.
+    파일명 규칙: {class_id}.ext  또는  {class_id}_N.ext
+    반환: (copied, deleted)"""
+    import shutil
+
+    src_refs = src_cfg / "refs"
+    tgt_refs = tgt_cfg / "refs"
+
+    if not src_refs.exists():
+        return 0, 0
+
+    tgt_refs.mkdir(parents=True, exist_ok=True)
+
+    # 소스 refs 이미지 → 클래스 ID별 수집
+    src_by_class: dict = {}
+    for f in sorted(src_refs.iterdir()):
+        if f.suffix.lower() not in IMG_EXTS:
+            continue
+        stem = f.stem
+        try:
+            cls_id = int(stem.split("_")[0])
+        except ValueError:
+            continue
+        src_by_class.setdefault(cls_id, []).append(f)
+
+    # 기존 대상 refs 이미지 전체 삭제
+    deleted = 0
+    for f in list(tgt_refs.iterdir()):
+        if f.suffix.lower() in IMG_EXTS:
+            f.unlink()
+            deleted += 1
+
+    # 소스 refs → 대상 refs 복사 (remap 적용, 매핑 없는 클래스 제외)
+    copied = 0
+    for src_cls, files in sorted(src_by_class.items()):
+        if src_cls not in remap:
+            continue
+        tgt_cls = remap[src_cls]
+        for i, src_file in enumerate(files):
+            new_name = (f"{tgt_cls}{src_file.suffix}" if len(files) == 1
+                        else f"{tgt_cls}_{i}{src_file.suffix}")
+            shutil.copy2(src_file, tgt_refs / new_name)
+            copied += 1
+
+    return copied, deleted
+
+
 def build_config_remap(src_names: dict, tgt_names: dict) -> tuple:
     """소스 config → 타겟 config 클래스 ID 매핑.
     반환: (remap: {src_id → tgt_id}, skipped: [(src_id, name)])"""
@@ -539,6 +596,9 @@ class AutoLabelWindow(QMainWindow):
         btn_src_cfg.clicked.connect(self._browse_conv_src_cfg)
         src_cfg_row.addWidget(btn_src_cfg)
         layout.addLayout(src_cfg_row)
+        self.conv_src_refs_label = QLabel("")
+        self.conv_src_refs_label.setStyleSheet("color:#777; font-size:11px; margin-left:4px;")
+        layout.addWidget(self.conv_src_refs_label)
 
         layout.addWidget(self._section("대상 Config 폴더  (변환 후 클래스 기준 — obj.names 포함)"))
         tgt_cfg_row = QHBoxLayout()
@@ -551,6 +611,23 @@ class AutoLabelWindow(QMainWindow):
         btn_tgt_cfg.clicked.connect(self._browse_conv_tgt_cfg)
         tgt_cfg_row.addWidget(btn_tgt_cfg)
         layout.addLayout(tgt_cfg_row)
+        self.conv_tgt_refs_label = QLabel("")
+        self.conv_tgt_refs_label.setStyleSheet("color:#777; font-size:11px; margin-left:4px;")
+        layout.addWidget(self.conv_tgt_refs_label)
+
+        # refs 갱신 버튼 (독립 실행)
+        refs_btn_row = QHBoxLayout()
+        self.btn_update_refs = QPushButton("🖼️  refs 갱신  (소스 → 대상 Config)")
+        self.btn_update_refs.setFixedHeight(30)
+        self.btn_update_refs.setStyleSheet(
+            "QPushButton{background:#5a3e8a;color:white;border-radius:4px;"
+            "font-weight:bold;}"
+            "QPushButton:hover{background:#3e2a60;}"
+            "QPushButton:disabled{background:#aaa;}")
+        self.btn_update_refs.clicked.connect(self._do_update_refs)
+        refs_btn_row.addWidget(self.btn_update_refs)
+        refs_btn_row.addStretch()
+        layout.addLayout(refs_btn_row)
 
         # 클래스 매핑 미리보기
         layout.addWidget(self._section("클래스 매핑 미리보기"))
@@ -667,6 +744,17 @@ class AutoLabelWindow(QMainWindow):
         self.conv_map_list.clear()
         src_p = self.conv_src_cfg_edit.text().strip()
         tgt_p = self.conv_tgt_cfg_edit.text().strip()
+
+        # refs 정보 업데이트
+        if src_p and Path(src_p).is_dir():
+            self.conv_src_refs_label.setText(f"  📁 {refs_info(Path(src_p))}")
+        else:
+            self.conv_src_refs_label.setText("")
+        if tgt_p and Path(tgt_p).is_dir():
+            self.conv_tgt_refs_label.setText(f"  📁 {refs_info(Path(tgt_p))}")
+        else:
+            self.conv_tgt_refs_label.setText("")
+
         if not src_p or not tgt_p:
             return
         try:
@@ -766,6 +854,25 @@ class AutoLabelWindow(QMainWindow):
         self.conv_progress.setValue(self.conv_progress.maximum())
         self.btn_conv_run.setEnabled(True)
         self.btn_conv_stop.setEnabled(False)
+
+    def _do_update_refs(self):
+        """refs 갱신 버튼 — 소스 config의 refs를 remap 적용해 대상 config refs에 복사."""
+        src_cfg = self.conv_src_cfg_edit.text().strip()
+        tgt_cfg = self.conv_tgt_cfg_edit.text().strip()
+        if not src_cfg or not tgt_cfg:
+            self._conv_log("[refs] 소스/대상 Config 폴더를 먼저 선택하세요.")
+            return
+        try:
+            src_names = load_obj_names(Path(src_cfg))
+            tgt_names = load_obj_names(Path(tgt_cfg))
+            remap, skipped = build_config_remap(src_names, tgt_names)
+            copied, deleted = update_refs_folder(Path(src_cfg), Path(tgt_cfg), remap)
+            self._conv_log(
+                f"[refs] 갱신 완료 — 기존 삭제 {deleted}개 / 복사 {copied}개"
+                f"  (제외 클래스 {len(skipped)}개)")
+            self.conv_tgt_refs_label.setText(f"  📁 {refs_info(Path(tgt_cfg))}")
+        except Exception as e:
+            self._conv_log(f"[refs 오류] {e}")
 
     def _conv_on_error(self, msg: str):
         self._conv_log(f"[오류]\n{msg}")
