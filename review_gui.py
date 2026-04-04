@@ -526,6 +526,7 @@ class ReviewApp(QMainWindow):
         self._num_classes      = load_class_count(CONFIG_DIR)
         self._sort_key         = "score_asc"   # 현재 정렬 기준
         self._filter_classes: set = set()      # 클래스 ID 필터 (빈 set = 전체 표시)
+        self._filter_cls23_eq7: bool = False   # (cls2+cls3)==7 필터
 
         # ── ImageReviewWindow 상태 ───────────────────────────────────────────
         self.cur_idx           = 0
@@ -773,6 +774,13 @@ class ReviewApp(QMainWindow):
         self.filter_count_label.setVisible(False)
         lv.addWidget(self.filter_count_label)
 
+        self.chk_cls23_eq7 = QCheckBox("(cls2 + cls3) = 7 인 이미지만")
+        self.chk_cls23_eq7.setStyleSheet(
+            "QCheckBox{color:#FFD700; font-size:11px; padding:2px 0;}"
+            "QCheckBox::indicator{width:13px;height:13px;}")
+        self.chk_cls23_eq7.stateChanged.connect(self._on_cls23_filter_changed)
+        lv.addWidget(self.chk_cls23_eq7)
+
         # 구분선
         sep = QFrame()
         sep.setFrameShape(QFrame.HLine)
@@ -977,7 +985,22 @@ class ReviewApp(QMainWindow):
                 if "class_ids" not in r:
                     r["class_ids"] = get_class_ids(r["txt_path"])
                 if not self._filter_classes.issubset(r["class_ids"]):
-                    continue   # 필터 클래스 모두 포함하지 않는 이미지 제외
+                    continue
+
+            # ── (cls2+cls3)==7 필터 ────────────────────────────────────
+            if self._filter_cls23_eq7:
+                if "cls_counts" not in r:
+                    from collections import Counter
+                    cnt = Counter()
+                    if r["txt_path"].exists():
+                        for line in r["txt_path"].read_text().splitlines():
+                            parts = line.strip().split()
+                            if len(parts) == 5:
+                                try: cnt[int(parts[0])] += 1
+                                except ValueError: pass
+                    r["cls_counts"] = cnt
+                if r["cls_counts"].get(2, 0) + r["cls_counts"].get(3, 0) != 7:
+                    continue
 
             score     = r["score"]
             confirmed = r.get("confirmed", False)
@@ -1014,7 +1037,7 @@ class ReviewApp(QMainWindow):
         self.file_list.blockSignals(False)
 
         # 필터 카운트 라벨 갱신
-        if self._filter_classes:
+        if self._filter_classes or self._filter_cls23_eq7:
             self.filter_count_label.setText(
                 f"  {visible_count} / {len(self.results)}개 이미지 표시중")
             self.filter_count_label.setVisible(True)
@@ -1157,6 +1180,13 @@ class ReviewApp(QMainWindow):
         has = bool(self._filter_classes)
         self.filter_tag_list.setVisible(has)
         self.filter_count_label.setVisible(has)
+
+    def _on_cls23_filter_changed(self, state: int):
+        self._filter_cls23_eq7 = bool(state)
+        # 캐시 무효화
+        for r in self.results:
+            r.pop("cls_counts", None)
+        self._apply_filter_and_reload()
 
     def _apply_filter_and_reload(self):
         self._populate_list()
