@@ -458,56 +458,18 @@ class MainWindow(QMainWindow):
         rv.addWidget(self._info_bar)
 
         # 클래스별 박스 개수 리스트
-        cls_wrap = QFrame()
-        cls_wrap.setStyleSheet(
-            "QFrame { background:#181818; border:1px solid #333; border-radius:4px; }"
+        self._cls_list = QListWidget()
+        self._cls_list.setMaximumHeight(130)
+        self._cls_list.setMinimumHeight(40)
+        self._cls_list.setFont(QFont("Courier New", 11))
+        self._cls_list.setFocusPolicy(Qt.NoFocus)
+        self._cls_list.setStyleSheet(
+            "QListWidget { background:#181818; color:#eee; border:1px solid #333;"
+            "  border-radius:4px; outline:none; }"
+            "QListWidget::item { padding:2px 8px; }"
+            "QListWidget::item:selected { background:transparent; color:#eee; }"
         )
-        cls_wrap.setMaximumHeight(180)
-        cls_wrap.setMinimumHeight(52)
-        cls_wv = QVBoxLayout(cls_wrap)
-        cls_wv.setContentsMargins(0, 0, 0, 0)
-        cls_wv.setSpacing(0)
-
-        # 헤더 행
-        hdr_row = QFrame()
-        hdr_row.setFixedHeight(22)
-        hdr_row.setStyleSheet("background:#252525; border:none; border-bottom:1px solid #3a3a3a;")
-        hdr_h = QHBoxLayout(hdr_row)
-        hdr_h.setContentsMargins(6, 0, 6, 0)
-        hdr_h.setSpacing(0)
-        for txt, w, align in [
-            ("cls",  38,  Qt.AlignCenter),
-            ("클래스명", -1, Qt.AlignLeft | Qt.AlignVCenter),
-            ("A",    48,  Qt.AlignCenter),
-            ("B",    48,  Qt.AlignCenter),
-            ("Δ",    46,  Qt.AlignCenter),
-        ]:
-            lbl = QLabel(txt)
-            lbl.setStyleSheet("color:#888; font-size:10px; font-weight:bold; background:transparent;")
-            lbl.setAlignment(align)
-            if w > 0:
-                lbl.setFixedWidth(w)
-            else:
-                lbl.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Preferred)
-            hdr_h.addWidget(lbl)
-        cls_wv.addWidget(hdr_row)
-
-        # 스크롤 영역 (실제 행들)
-        cls_scroll = QScrollArea()
-        cls_scroll.setWidgetResizable(True)
-        cls_scroll.setFrameShape(QFrame.NoFrame)
-        cls_scroll.setHorizontalScrollBarPolicy(Qt.ScrollBarAlwaysOff)
-        cls_scroll.setStyleSheet("QScrollArea { background:transparent; border:none; }")
-        self._cls_rows_widget = QWidget()
-        self._cls_rows_widget.setStyleSheet("background:transparent;")
-        self._cls_rows_layout = QVBoxLayout(self._cls_rows_widget)
-        self._cls_rows_layout.setContentsMargins(0, 0, 0, 0)
-        self._cls_rows_layout.setSpacing(0)
-        self._cls_rows_layout.addStretch()
-        cls_scroll.setWidget(self._cls_rows_widget)
-        cls_wv.addWidget(cls_scroll)
-
-        rv.addWidget(cls_wrap)
+        rv.addWidget(self._cls_list)
 
         # 캔버스 스크롤
         scroll = QScrollArea()
@@ -714,78 +676,23 @@ class MainWindow(QMainWindow):
 
         all_cls = sorted(set(cnt_a) | set(cnt_b))
 
-        # 기존 행 위젯 전부 제거
-        layout = self._cls_rows_layout
-        while layout.count() > 1:          # 마지막 stretch 유지
-            item = layout.takeAt(0)
-            if item.widget():
-                item.widget().deleteLater()
-
-        for idx, cls in enumerate(all_cls):
+        self._cls_list.clear()
+        for cls in all_cls:
             a_cnt = cnt_a.get(cls, 0)
             b_cnt = cnt_b.get(cls, 0)
             delta = b_cnt - a_cnt
             name  = self._names_a.get(cls) or self._names_b.get(cls) or "?"
 
-            # 행 프레임 (짝/홀 배경 교대)
-            bg = "#1e1e1e" if idx % 2 == 0 else "#222222"
-            row_frame = QFrame()
-            row_frame.setFixedHeight(24)
-            row_frame.setStyleSheet(
-                f"QFrame {{ background:{bg}; border:none; }}"
-                f"QFrame:hover {{ background:#2a3a4a; }}"
-            )
-            rh = QHBoxLayout(row_frame)
-            rh.setContentsMargins(6, 0, 6, 0)
-            rh.setSpacing(0)
+            d_str = f"+{delta}" if delta > 0 else ("=" if delta == 0 else str(delta))
+            # 고정폭 정렬: [cls]  name  A:N  B:N  Δ
+            text = f"[{cls:2d}]  {name:<16}  A:{a_cnt:3d}   B:{b_cnt:3d}   Δ{d_str}"
 
-            def lbl(text: str, color: str, width: int = -1,
-                    align=Qt.AlignCenter, bold=False) -> QLabel:
-                w = QLabel(text)
-                style = (f"color:{color}; font-size:12px; background:transparent;"
-                         + (" font-weight:bold;" if bold else ""))
-                w.setStyleSheet(style)
-                w.setAlignment(align)
-                if width > 0:
-                    w.setFixedWidth(width)
-                else:
-                    w.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Preferred)
-                return w
-
-            # [cls id]
-            rh.addWidget(lbl(f"[{cls}]", "#888888", width=38,
-                             align=Qt.AlignCenter))
-
-            # 클래스명
-            name_col = lbl(name, "#dddddd", align=Qt.AlignLeft | Qt.AlignVCenter,
-                           bold=(delta != 0))
-            rh.addWidget(name_col)
-
-            # 구분선
-            sep = QFrame()
-            sep.setFrameShape(QFrame.VLine)
-            sep.setStyleSheet("color:#333; background:#333;")
-            sep.setFixedWidth(1)
-            rh.addWidget(sep)
-
-            # A 개수
-            a_color = "#FF7777" if a_cnt > 0 else "#484848"
-            rh.addWidget(lbl(f"A  {a_cnt}", a_color, width=48))
-
-            # B 개수
-            b_color = "#5599FF" if b_cnt > 0 else "#484848"
-            rh.addWidget(lbl(f"B  {b_cnt}", b_color, width=48))
-
-            # 델타
-            if delta == 0:
-                d_text, d_color = "=", "#55AA55"
-            elif delta > 0:
-                d_text, d_color = f"+{delta}", "#5599FF"
+            item = QListWidgetItem(text)
+            if delta != 0:
+                item.setForeground(QColor("#FF9966"))
             else:
-                d_text, d_color = str(delta), "#FF7777"
-            rh.addWidget(lbl(d_text, d_color, width=46, bold=(delta != 0)))
-
-            layout.insertWidget(layout.count() - 1, row_frame)
+                item.setForeground(QColor("#77CC77"))
+            self._cls_list.addItem(item)
 
     # ── 컨트롤 슬롯 ──────────────────────────────────────────────────────────
 
