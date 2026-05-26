@@ -13,16 +13,7 @@ from pathlib import Path
 
 import cv2
 import numpy as np
-import torch
 import yaml
-
-
-def get_device() -> str:
-    if torch.backends.mps.is_available():
-        return "mps"
-    if torch.cuda.is_available():
-        return "cuda"
-    return "cpu"
 
 
 from PyQt5.QtWidgets import (
@@ -39,10 +30,23 @@ from PyQt5.QtCore import Qt, QThread, pyqtSignal, QPoint, QPointF, QRectF, QTime
 # ── 경로 ─────────────────────────────────────────────────────────────────────
 SCRIPT_DIR   = Path(__file__).resolve().parent
 PROJECT_ROOT = SCRIPT_DIR
-MODEL_PATH   = PROJECT_ROOT / "auto/runs/detect/train/weights/best.pt"
 DATASET_YAML = PROJECT_ROOT / "dataset.yaml"
 CONFIG_DIR   = SCRIPT_DIR / "config"
 REFS_DIR     = SCRIPT_DIR / "refs"
+PREFS_PATH   = SCRIPT_DIR / ".review_prefs.json"
+
+# ── 기본 사용자 설정 ──────────────────────────────────────────────────────────
+_DEFAULT_PREFS: dict = {
+    "config_name": None,   # None → CONFIG_DIR 사용
+    "auto_confirm": True,
+    "dup_iou":  85,        # 슬라이더 정수값 (50-100)
+    "dup_area": 75,        # 슬라이더 정수값 (30-100)
+    "sort_key": "name_asc",
+    "window_w": 1600,
+    "window_h": 900,
+    "show_minimap": True,
+    "show_class_preview": True,
+}
 
 # ── 다크 테마 ─────────────────────────────────────────────────────────────────
 DARK = """
@@ -233,7 +237,199 @@ def _is_same_box_pair(x1i, y1i, x2i, y2i, x1j, y1j, x2j, y2j,
     return (min(ai, aj) / max(ai, aj)) >= area_ratio_thresh
 
 
-def compute_has_duplicate(txt_path: Path) -> bool:
+def _merge_width_overlapping_boxes(boxes, thresh=0.5):
+    """너비 50% 이상 겹치는 박스를 외곽 바운딩박스로 합침.
+    boxes: list of (cls, x1, y1, x2, y2) pixel coords
+    Returns: new list (merged where needed).
+    """
+    from collections import defaultdict
+    n = len(boxes)
+    if n < 2:
+        return list(boxes)
+
+    parent = list(range(n))
+
+    def find(i):
+        while parent[i] != i:
+            parent[i] = parent[parent[i]]
+            i = parent[i]
+        return i
+
+    def union(i, j):
+        pi, pj = find(i), find(j)
+        if pi != pj:
+            parent[pi] = pj
+
+    for i in range(n):
+        _, x1i, y1i, x2i, y2i = boxes[i]
+        area_i = (x2i - x1i) * (y2i - y1i)
+        for j in range(i + 1, n):
+            _, x1j, y1j, x2j, y2j = boxes[j]
+            area_j = (x2j - x1j) * (y2j - y1j)
+            inter_x = max(0.0, min(x2i, x2j) - max(x1i, x1j))
+            inter_y = max(0.0, min(y2i, y2j) - max(y1i, y1j))
+            inter_area = inter_x * inter_y
+            min_area = min(area_i, area_j)
+            if min_area > 0 and inter_area / min_area >= thresh:
+                union(i, j)
+
+    groups = defaultdict(list)
+    for i in range(n):
+        groups[find(i)].append(i)
+
+    result = []
+    for members in groups.values():
+        if len(members) == 1:
+            result.append(boxes[members[0]])
+        else:
+            best_cls, best_area = boxes[members[0]][0], 0
+            x1s, y1s, x2s, y2s = [], [], [], []
+            for idx in members:
+                cls, x1, y1, x2, y2 = boxes[idx]
+                area = (x2 - x1) * (y2 - y1)
+                if area > best_area:
+                    best_area, best_cls = area, cls
+                x1s.append(x1); y1s.append(y1)
+                x2s.append(x2); y2s.append(y2)
+            result.append((best_cls, min(x1s), min(y1s), max(x2s), max(y2s)))
+    return result
+
+
+def _merge_width_overlapping_txt(txt_path: Path, thresh=0.5) -> int:
+    """YOLO txt 파일에서 너비 겹침 박스를 직접 병합 저장. 변경된 박스 수 반환."""
+    if not txt_path.exists():
+        return 0
+    raw = []
+    for line in txt_path.read_text().strip().splitlines():
+        parts = line.strip().split()
+        if len(parts) == 5:
+            cls = int(parts[0])
+            cx, cy, w, h = map(float, parts[1:])
+            raw.append((cls, cx - w/2, cy - h/2, cx + w/2, cy + h/2))
+
+    from collections import defaultdict
+    n = len(raw)
+    if n < 2:
+        return 0
+    parent = list(range(n))
+
+    def find(i):
+        while parent[i] != i:
+            parent[i] = parent[parent[i]]
+            i = parent[i]
+        return i
+
+    for i in range(n):
+        _, x1i, y1i, x2i, y2i = raw[i]
+        area_i = (x2i - x1i) * (y2i - y1i)
+        for j in range(i + 1, n):
+            _, x1j, y1j, x2j, y2j = raw[j]
+            area_j = (x2j - x1j) * (y2j - y1j)
+            inter_x = max(0.0, min(x2i, x2j) - max(x1i, x1j))
+            inter_y = max(0.0, min(y2i, y2j) - max(y1i, y1j))
+            inter_area = inter_x * inter_y
+            min_area = min(area_i, area_j)
+            if min_area > 0 and inter_area / min_area >= thresh:
+                pi, pj = find(i), find(j)
+                if pi != pj:
+                    parent[pi] = pj
+
+    groups = defaultdict(list)
+    for i in range(n):
+        groups[find(i)].append(i)
+
+    if all(len(m) == 1 for m in groups.values()):
+        return 0  # 변경 없음
+
+    lines = []
+    for members in groups.values():
+        if len(members) == 1:
+            cls, x1, y1, x2, y2 = raw[members[0]]
+        else:
+            best_cls, best_area = raw[members[0]][0], 0
+            x1s, y1s, x2s, y2s = [], [], [], []
+            for idx in members:
+                cls, x1, y1, x2, y2 = raw[idx]
+                area = (x2 - x1) * (y2 - y1)
+                if area > best_area:
+                    best_area, best_cls = area, cls
+                x1s.append(x1); y1s.append(y1)
+                x2s.append(x2); y2s.append(y2)
+            cls = best_cls
+            x1, y1, x2, y2 = min(x1s), min(y1s), max(x2s), max(y2s)
+        cx = (x1 + x2) / 2; cy = (y1 + y2) / 2
+        w  = x2 - x1;       h  = y2 - y1
+        lines.append(f"{cls} {cx:.6f} {cy:.6f} {w:.6f} {h:.6f}")
+
+    txt_path.write_text("\n".join(lines) + "\n", encoding="utf-8")
+    return n - len(lines)
+
+
+def _remove_border_small_boxes(boxes, img_w, img_h):
+    """이미지 테두리에 걸친 박스 중 평균 면적의 절반 미만인 것 제거.
+    boxes: list of (cls, x1, y1, x2, y2) pixel coords
+    Returns: (new_boxes, removed_count)
+    """
+    EPS = 1.0
+    border_idx = set()
+    inner_areas = []
+    for i, (_, x1, y1, x2, y2) in enumerate(boxes):
+        on_border = (x1 <= EPS or y1 <= EPS or
+                     x2 >= img_w - EPS or y2 >= img_h - EPS)
+        if on_border:
+            border_idx.add(i)
+        else:
+            inner_areas.append((x2 - x1) * (y2 - y1))
+
+    if not border_idx:
+        return list(boxes), 0
+
+    if inner_areas:
+        avg_area = sum(inner_areas) / len(inner_areas)
+    else:
+        # 내부 박스가 없으면 전체 평균 사용
+        all_areas = [(b[3]-b[1])*(b[4]-b[2]) for b in boxes]
+        avg_area = sum(all_areas) / len(all_areas) if all_areas else 0
+
+    threshold = avg_area * 0.5
+    to_remove = {i for i in border_idx
+                 if (boxes[i][3]-boxes[i][1])*(boxes[i][4]-boxes[i][2]) < threshold}
+
+    if not to_remove:
+        return list(boxes), 0
+
+    new_boxes = [b for i, b in enumerate(boxes) if i not in to_remove]
+    return new_boxes, len(to_remove)
+
+
+def _remove_border_small_boxes_txt(txt_path: Path) -> int:
+    """YOLO txt 파일에서 테두리 소형 박스 제거. 제거된 박스 수 반환."""
+    if not txt_path.exists():
+        return 0
+    raw = []
+    for line in txt_path.read_text().strip().splitlines():
+        parts = line.strip().split()
+        if len(parts) == 5:
+            cls = int(parts[0])
+            cx, cy, w, h = map(float, parts[1:])
+            raw.append((cls, cx - w/2, cy - h/2, cx + w/2, cy + h/2))
+
+    merged, removed = _remove_border_small_boxes(raw, 1.0, 1.0)
+    if not removed:
+        return 0
+
+    lines = []
+    for cls, x1, y1, x2, y2 in merged:
+        cx = (x1 + x2) / 2; cy = (y1 + y2) / 2
+        w  = x2 - x1;       h  = y2 - y1
+        lines.append(f"{cls} {cx:.6f} {cy:.6f} {w:.6f} {h:.6f}")
+    txt_path.write_text("\n".join(lines) + "\n", encoding="utf-8")
+    return removed
+
+
+def compute_has_duplicate(txt_path: Path,
+                          iou_thresh=_DUP_IOU_THRESH,
+                          area_thresh=_DUP_AREA_RATIO) -> bool:
     boxes = []
     if txt_path.exists():
         for line in txt_path.read_text().strip().splitlines():
@@ -249,7 +445,8 @@ def compute_has_duplicate(txt_path: Path) -> bool:
             cj, x1j, y1j, x2j, y2j = boxes[j]
             if ci == cj:
                 continue
-            if _is_same_box_pair(x1i, y1i, x2i, y2i, x1j, y1j, x2j, y2j):
+            if _is_same_box_pair(x1i, y1i, x2i, y2i, x1j, y1j, x2j, y2j,
+                                  iou_thresh, area_thresh):
                 return True
     return False
 
@@ -309,7 +506,6 @@ def save_cache(folder: Path, results: list) -> tuple:
         data = {
             "version": CACHE_VERSION,
             "folder":  str(folder.resolve()),
-            "model":   str(MODEL_PATH),
             "ts":      time.time(),
             "results": results,
         }
@@ -336,39 +532,6 @@ def load_cache(folder: Path):
         return results, f"{len(results)}개 로드"
     except Exception as e:
         return None, f"캐시 손상: {e}"
-
-
-# ══════════════════════════════════════════════════════════════════════════════
-# Cleanlab 포맷 변환
-# ══════════════════════════════════════════════════════════════════════════════
-def _load_gt_cleanlab(txt_path: Path):
-    bboxes, cls_ids = [], []
-    if txt_path.exists():
-        for line in txt_path.read_text().strip().splitlines():
-            parts = line.split()
-            if len(parts) == 5:
-                c, cx, cy, w, h = int(parts[0]), *map(float, parts[1:])
-                bboxes.append(yolo_to_xyxy_norm(cx, cy, w, h))
-                cls_ids.append(c)
-    return {
-        "bboxes": np.array(bboxes,  dtype=float).reshape(-1, 4),
-        "labels": np.array(cls_ids, dtype=int),
-    }
-
-
-def _to_cleanlab_preds(raw_preds: list, num_classes: int):
-    cl = []
-    for raw in raw_preds:
-        per = []
-        for k in range(num_classes):
-            if len(raw) == 0:
-                per.append(np.zeros((0, 5), dtype=float))
-            else:
-                mask = raw[:, 5].astype(int) == k
-                per.append(raw[mask][:, :5] if mask.any()
-                            else np.zeros((0, 5), dtype=float))
-        cl.append(per)
-    return cl
 
 
 # ══════════════════════════════════════════════════════════════════════════════
@@ -402,7 +565,7 @@ class ZipWorker(QThread):
 
 
 # ══════════════════════════════════════════════════════════════════════════════
-# 검수 워커 (원본 유지)
+# 검수 워커
 # ══════════════════════════════════════════════════════════════════════════════
 class ReviewWorker(QThread):
     progress   = pyqtSignal(int, int)
@@ -410,21 +573,14 @@ class ReviewWorker(QThread):
     finished   = pyqtSignal(list)
     error      = pyqtSignal(str)
 
-    def __init__(self, folder: Path, num_classes: int = 31, conf: float = 0.01,
-                 file_filter=None, auto_confirm: bool = True):
+    def __init__(self, folder: Path, file_filter=None, auto_confirm: bool = True):
         super().__init__()
         self.folder       = folder
-        self.num_classes  = num_classes
-        self.conf         = conf
         self.file_filter  = file_filter
         self.auto_confirm = auto_confirm
 
     def run(self):
         try:
-            from ultralytics import YOLO
-            from cleanlab.object_detection.filter import find_label_issues
-            from cleanlab.object_detection.rank   import get_label_quality_scores
-
             img_exts = {".jpg", ".jpeg", ".png", ".bmp"}
             pairs = []
             for p in sorted(self.folder.iterdir()):
@@ -439,43 +595,26 @@ class ReviewWorker(QThread):
 
             total = len(pairs)
             label = "수정된" if self.file_filter else "전체"
-            self.status_msg.emit(f"{label} {total}개 파일. 모델 로딩 중...")
-            gt_labels = [_load_gt_cleanlab(txt) for _, txt in pairs]
-
-            model = YOLO(str(MODEL_PATH))
-            raw_preds, batch = [], 32
-            img_paths = [str(p) for p, _ in pairs]
-
-            for i in range(0, total, batch):
-                results = model.predict(img_paths[i:i+batch],
-                                        conf=self.conf, device=get_device(), verbose=False)
-                for r in results:
-                    boxes = r.boxes
-                    if boxes is None or len(boxes) == 0:
-                        raw_preds.append(np.zeros((0, 6), dtype=float))
-                        continue
-                    xyxy  = boxes.xyxyn.cpu().numpy()
-                    confs = boxes.conf.cpu().numpy().reshape(-1, 1)
-                    cls   = boxes.cls.cpu().numpy().reshape(-1, 1)
-                    raw_preds.append(np.hstack([xyxy, confs, cls]))
-                self.progress.emit(min(i + batch, total), total)
-
-            self.status_msg.emit("Cleanlab 점수 계산 중...")
-            cl_preds = _to_cleanlab_preds(raw_preds, self.num_classes)
-            scores   = get_label_quality_scores(gt_labels, cl_preds, verbose=False)
-            issues   = find_label_issues(gt_labels, cl_preds)
+            self.status_msg.emit(f"{label} {total}개 파일 스캔 중...")
 
             out = []
             for i, (img_path, txt_path) in enumerate(pairs):
-                s = float(scores[i])
+                has_dup   = compute_has_duplicate(txt_path)
+                box_count = 0
+                if txt_path.exists():
+                    box_count = sum(
+                        1 for ln in txt_path.read_text().strip().splitlines()
+                        if len(ln.split()) == 5
+                    )
                 out.append({
-                    "img_path":  img_path,
-                    "txt_path":  txt_path,
-                    "score":     s,
-                    "is_issue":  bool(issues[i]),
-                    "box_count": int(len(gt_labels[i]["labels"])),
-                    "confirmed": self.auto_confirm and s >= 1.0,
+                    "img_path":      img_path,
+                    "txt_path":      txt_path,
+                    "is_issue":      has_dup,
+                    "has_duplicate": has_dup,
+                    "box_count":     box_count,
+                    "confirmed":     self.auto_confirm and not has_dup,
                 })
+                self.progress.emit(i + 1, total)
             self.finished.emit(out)
 
         except Exception:
@@ -496,15 +635,119 @@ class CanvasLabel(QLabel):
         self.setStyleSheet("background: #2a2a2a;")
         self.setAlignment(Qt.AlignCenter)
 
-    def mousePressEvent(self, e):   self._app._canvas_mouse_press(e)
-    def mouseMoveEvent(self, e):    self._app._canvas_mouse_move(e)
-    def mouseReleaseEvent(self, e): self._app._canvas_mouse_release(e)
-    def wheelEvent(self, e):        self._app._canvas_wheel(e)
+    def mousePressEvent(self, e):   self._app._canvas_mouse_press(e);   e.accept()
+    def mouseMoveEvent(self, e):    self._app._canvas_mouse_move(e);    e.accept()
+    def mouseReleaseEvent(self, e): self._app._canvas_mouse_release(e); e.accept()
+    def wheelEvent(self, e):        self._app._canvas_wheel(e);          e.accept()
     def keyPressEvent(self, e):     self._app._handle_key(e)
 
     def resizeEvent(self, e):
         super().resizeEvent(e)
         QTimer.singleShot(0, self._app._on_canvas_resize)
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+# 박스 수 인덱스 바 (iOS 연락처 이니셜 스타일)
+# ══════════════════════════════════════════════════════════════════════════════
+class _BoxIndexBar(QWidget):
+    """파일 리스트 옆에 붙는 박스 수 퀵점프 인덱스 바."""
+    jumpRequested = pyqtSignal(int)   # 스크롤할 row 인덱스
+
+    _BG        = QColor(28, 28, 28)
+    _FG        = QColor(140, 140, 140)
+    _HOVER_BG  = QColor(9, 71, 113)
+    _HOVER_FG  = QColor(255, 255, 255)
+    _ACTIVE_FG = QColor(100, 180, 255)
+
+    def __init__(self, parent=None):
+        super().__init__(parent)
+        self.setFixedWidth(26)
+        self.setCursor(Qt.PointingHandCursor)
+        self.setMouseTracking(True)
+        self._labels: list[tuple[str, int]] = []   # (표시텍스트, row)
+        self._hover_i  = -1
+        self._active_i = -1
+
+    # ── 외부 API ────────────────────────────────────────────────────────────
+    def set_labels(self, labels: list[tuple[str, int]]):
+        self._labels   = labels
+        self._hover_i  = -1
+        self._active_i = -1
+        self.update()
+
+    def set_active(self, row: int):
+        """현재 선택된 row에 해당하는 버킷 하이라이트."""
+        self._active_i = -1
+        for i, (_, r) in enumerate(self._labels):
+            if r <= row:
+                self._active_i = i
+            else:
+                break
+        self.update()
+
+    # ── 내부 헬퍼 ───────────────────────────────────────────────────────────
+    def _idx_at(self, y: int) -> int:
+        n = len(self._labels)
+        if n == 0:
+            return -1
+        slot = self.height() / n
+        return max(0, min(n - 1, int(y / slot)))
+
+    def _row_rect(self, i: int):
+        from PyQt5.QtCore import QRect
+        n = len(self._labels)
+        if n == 0:
+            return None
+        slot = self.height() / n
+        return QRect(0, int(i * slot), self.width(), int(slot) + 1)
+
+    # ── 그리기 ──────────────────────────────────────────────────────────────
+    def paintEvent(self, _):
+        from PyQt5.QtGui import QPainter, QFont
+        p = QPainter(self)
+        p.setRenderHint(QPainter.Antialiasing)
+        p.fillRect(self.rect(), self._BG)
+
+        n = len(self._labels)
+        if n == 0:
+            p.end()
+            return
+
+        font = QFont("Arial", 7, QFont.Bold)
+        p.setFont(font)
+
+        for i, (label, _) in enumerate(self._labels):
+            r = self._row_rect(i)
+            if i == self._hover_i:
+                p.fillRect(r, self._HOVER_BG)
+                p.setPen(self._HOVER_FG)
+            elif i == self._active_i:
+                p.setPen(self._ACTIVE_FG)
+            else:
+                p.setPen(self._FG)
+            p.drawText(r, Qt.AlignCenter, label)
+
+        p.end()
+
+    # ── 이벤트 ──────────────────────────────────────────────────────────────
+    def mousePressEvent(self, e):
+        i = self._idx_at(e.pos().y())
+        if 0 <= i < len(self._labels):
+            self.jumpRequested.emit(self._labels[i][1])
+        e.accept()
+
+    def mouseMoveEvent(self, e):
+        i = self._idx_at(e.pos().y())
+        if e.buttons() & Qt.LeftButton and 0 <= i < len(self._labels):
+            self.jumpRequested.emit(self._labels[i][1])
+        if i != self._hover_i:
+            self._hover_i = i
+            self.update()
+        e.accept()
+
+    def leaveEvent(self, _):
+        self._hover_i = -1
+        self.update()
 
 
 # ══════════════════════════════════════════════════════════════════════════════
@@ -524,9 +767,11 @@ class ReviewApp(QMainWindow):
         self.selected_folder   = None
         self.current_config_dir= CONFIG_DIR
         self._num_classes      = load_class_count(CONFIG_DIR)
-        self._sort_key         = "score_asc"   # 현재 정렬 기준
+        self._sort_key         = "name_asc"    # 현재 정렬 기준
         self._filter_classes: set = set()      # 클래스 ID 필터 (빈 set = 전체 표시)
         self._filter_cls23_eq7: bool = False   # (cls2+cls3)==7 필터
+        self._dup_iou   = _DUP_IOU_THRESH      # 중복 판단 IoU 임계값
+        self._dup_area  = _DUP_AREA_RATIO      # 중복 판단 면적 비율
 
         # ── ImageReviewWindow 상태 ───────────────────────────────────────────
         self.cur_idx           = 0
@@ -562,6 +807,7 @@ class ReviewApp(QMainWindow):
 
         self._build_ui()
         self.setStyleSheet(DARK)
+        self._load_prefs()
 
     # ══════════════════════════════════════════════════════════════════════════
     # UI 구성
@@ -573,44 +819,66 @@ class ReviewApp(QMainWindow):
         root.setContentsMargins(0, 0, 0, 0)
         root.setSpacing(0)
 
-        # ── 상단 툴바 ────────────────────────────────────────────────────────
-        tb = QWidget()
-        tb.setFixedHeight(100)
-        tb.setStyleSheet("background:#252526; border-bottom:1px solid #3a3a3a;")
-        tb_layout = QVBoxLayout(tb)
-        tb_layout.setContentsMargins(8, 4, 8, 4)
-        tb_layout.setSpacing(3)
-
-        row1 = QHBoxLayout(); row1.setSpacing(6)
-        self.folder_label = QLabel("폴더를 선택하세요")
-        self.folder_label.setStyleSheet(
-            "padding:3px 8px; border:1px solid #3a3a3a; border-radius:4px;"
-            "background:#1e1e1e; color:#aaa;")
-        self.folder_label.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Fixed)
-
-        def _btn(text, color=None, height=26):
+        # ── 공통 위젯 헬퍼 ──────────────────────────────────────────────────
+        def _btn(text, color=None, h=26, w=None):
             b = QPushButton(text)
-            b.setFixedHeight(height)
+            b.setFixedHeight(h)
+            if w: b.setFixedWidth(w)
             if color:
                 b.setStyleSheet(
-                    f"QPushButton{{background:{color};color:white;border-radius:4px;"
-                    f"font-weight:bold;border:none;padding:3px 10px;}}"
+                    f"QPushButton{{background:{color};color:#fff;border-radius:4px;"
+                    f"font-weight:bold;border:none;padding:2px 8px;}}"
                     f"QPushButton:hover{{background:{color}cc;}}"
-                    f"QPushButton:disabled{{background:#2a2a2a;color:#555;border:1px solid #3a3a3a;}}")
+                    f"QPushButton:disabled{{background:#2a2a2a;color:#555;"
+                    f"border:1px solid #3a3a3a;}}")
             return b
 
-        btn_sel           = _btn("📁 폴더 선택")
-        self.btn_review   = _btn("🔍 전부 검수",  "#0e639c")
-        self.btn_partial  = _btn("🔄 재검수",      "#b85c00")
-        self.btn_rev_sel  = _btn("☑ 선택 검수",   "#7d3c98")
-        self.btn_confirm_all   = _btn("✅ 전체 확인",  "#218838")
-        self.btn_confirm_sel   = _btn("☑ 선택 확인",  "#4cae4c")
-        self.btn_unconfirm_all = _btn("✖ 확인 해제",  "#5a6268")
-        self.btn_remove_dups   = _btn("🗑 중복 제거",  "#c0392b")
+        def _vsep():
+            s = QFrame(); s.setFrameShape(QFrame.VLine)
+            s.setStyleSheet("color:#444;")
+            return s
+
+        def _hsep():
+            s = QFrame(); s.setFrameShape(QFrame.HLine)
+            s.setStyleSheet("color:#3a3a3a;")
+            return s
+
+        def _sec(text):
+            l = QLabel(text)
+            l.setStyleSheet(
+                "background:#333;color:#dcdcdc;font-weight:bold;"
+                "padding:3px 6px;border-radius:3px;font-size:11px;")
+            return l
+
+        # ── 상단 툴바 (2행) ──────────────────────────────────────────────────
+        tb = QWidget()
+        tb.setStyleSheet("background:#252526;border-bottom:1px solid #3a3a3a;")
+        tbl = QVBoxLayout(tb)
+        tbl.setContentsMargins(8, 5, 8, 5)
+        tbl.setSpacing(4)
+
+        # 행 1: 폴더 · 검수 · 확인 · 편집
+        r1 = QHBoxLayout(); r1.setSpacing(4)
+        self.folder_label = QLabel("폴더를 선택하세요")
+        self.folder_label.setStyleSheet(
+            "padding:2px 8px;border:1px solid #3a3a3a;border-radius:4px;"
+            "background:#1e1e1e;color:#aaa;")
+        self.folder_label.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Fixed)
+
+        btn_sel              = _btn("📁 폴더 선택")
+        self.btn_review      = _btn("🔍 전부 검수",    "#0e639c")
+        self.btn_partial     = _btn("🔄 재검수",        "#b85c00")
+        self.btn_rev_sel     = _btn("☑ 선택 검수",     "#7d3c98")
+        self.btn_confirm_all   = _btn("✅ 전체 확인",   "#218838")
+        self.btn_confirm_sel   = _btn("☑ 선택 확인",   "#4cae4c")
+        self.btn_unconfirm_all = _btn("✖ 확인 해제",   "#5a6268")
+        self.btn_remove_dups   = _btn("🗑 중복 제거",   "#c0392b")
+        self.btn_merge_all     = _btn("🔗 전체 통합",   "#1a6b5a")
+        self.btn_rm_border_all = _btn("✂ 테두리 제거",  "#6b3a1a")
 
         for b in (self.btn_review, self.btn_partial, self.btn_rev_sel,
-                  self.btn_confirm_all, self.btn_confirm_sel,
-                  self.btn_unconfirm_all, self.btn_remove_dups):
+                  self.btn_confirm_all, self.btn_confirm_sel, self.btn_unconfirm_all,
+                  self.btn_remove_dups, self.btn_merge_all, self.btn_rm_border_all):
             b.setEnabled(False)
 
         btn_sel.clicked.connect(self._select_folder)
@@ -621,27 +889,24 @@ class ReviewApp(QMainWindow):
         self.btn_confirm_sel.clicked.connect(self._confirm_selected_items)
         self.btn_unconfirm_all.clicked.connect(self._unconfirm_all)
         self.btn_remove_dups.clicked.connect(self._remove_all_duplicates)
+        self.btn_merge_all.clicked.connect(self._merge_all_overlapping)
+        self.btn_rm_border_all.clicked.connect(self._remove_border_boxes_all)
 
-        row1.addWidget(self.folder_label)
-        row1.addWidget(btn_sel)
-        row1.addWidget(self.btn_review)
-        row1.addWidget(self.btn_partial)
-        row1.addWidget(self.btn_rev_sel)
-        row1.addWidget(self.btn_confirm_all)
-        row1.addWidget(self.btn_confirm_sel)
-        row1.addWidget(self.btn_unconfirm_all)
-        row1.addWidget(self.btn_remove_dups)
-        tb_layout.addLayout(row1)
+        for w in [self.folder_label, btn_sel, _vsep(),
+                  self.btn_review, self.btn_partial, self.btn_rev_sel, _vsep(),
+                  self.btn_confirm_all, self.btn_confirm_sel, self.btn_unconfirm_all, _vsep(),
+                  self.btn_remove_dups, self.btn_merge_all, self.btn_rm_border_all]:
+            r1.addWidget(w)
+        tbl.addLayout(r1)
 
-        row2 = QHBoxLayout(); row2.setSpacing(6)
-        self.chk_auto_confirm = QCheckBox("검수 후 자동 확인 (점수=1.0)")
-        self.chk_auto_confirm.setChecked(True)
+        # 행 2: Config · 옵션 · 중복임계값 · 압축 · 상태
+        r2 = QHBoxLayout(); r2.setSpacing(5)
 
-        config_lbl = QLabel("Config:")
-        config_lbl.setStyleSheet("color:#aaa;")
+        cfg_lbl = QLabel("Config:")
+        cfg_lbl.setStyleSheet("color:#aaa;font-size:11px;")
         self.config_combo = QComboBox()
-        self.config_combo.setFixedHeight(24)
-        self.config_combo.setMinimumWidth(120)
+        self.config_combo.setFixedHeight(22)
+        self.config_combo.setMinimumWidth(110)
         for cdir in find_config_dirs():
             self.config_combo.addItem(cdir.name, userData=cdir)
         default_idx = next((i for i in range(self.config_combo.count())
@@ -649,81 +914,126 @@ class ReviewApp(QMainWindow):
         self.config_combo.setCurrentIndex(default_idx)
         self.config_combo.currentIndexChanged.connect(self._on_config_changed)
 
-        self.status_label = QLabel("준비")
-        self.status_label.setStyleSheet("color:#aaa; font-size:11px;")
-        self.progress_bar = QProgressBar()
-        self.progress_bar.setFixedHeight(12)
-        self.progress_bar.setVisible(False)
-        self.progress_bar.setFixedWidth(200)
+        self.chk_auto_confirm = QCheckBox("검수 후 자동 확인")
+        self.chk_auto_confirm.setChecked(True)
+        self.chk_auto_confirm.setStyleSheet("font-size:11px;")
+        self.chk_auto_confirm.stateChanged.connect(lambda _: self._save_prefs())
 
-        row2.addWidget(self.chk_auto_confirm)
-        row2.addSpacing(8)
-        row2.addWidget(config_lbl)
-        row2.addWidget(self.config_combo)
-        row2.addSpacing(8)
-        row2.addWidget(self.status_label)
-        row2.addWidget(self.progress_bar)
-        row2.addStretch()
-        tb_layout.addLayout(row2)
+        r2.addWidget(cfg_lbl)
+        r2.addWidget(self.config_combo)
+        r2.addWidget(_vsep())
+        r2.addWidget(self.chk_auto_confirm)
+        r2.addWidget(_vsep())
 
-        # ── row3: TXT 압축 ───────────────────────────────────────────────────
-        sep = QWidget(); sep.setFixedHeight(1)
-        sep.setStyleSheet("background:#3a3a3a;")
-        tb_layout.addWidget(sep)
+        dup_lbl = QLabel("🔁 중복:")
+        dup_lbl.setStyleSheet("color:#aaa;font-size:11px;")
+        r2.addWidget(dup_lbl)
+        self._dup_sliders: dict = {}   # attr → (QSlider, val_QLabel)
+        for attr, label, default, lo, hi in [
+            ("_dup_iou",  "IoU",  85, 50, 100),
+            ("_dup_area", "면적", 75, 30, 100),
+        ]:
+            lbl = QLabel(f"{label}:")
+            lbl.setStyleSheet("color:#ccc;font-size:11px;")
+            sl  = QSlider(Qt.Horizontal)
+            sl.setRange(lo, hi); sl.setValue(default)
+            sl.setFixedWidth(76); sl.setFixedHeight(16)
+            val = QLabel(f"{default/100:.2f}")
+            val.setFixedWidth(32)
+            val.setStyleSheet("color:#FFD700;font-size:11px;")
+            self._dup_sliders[attr] = (sl, val)
+            def _make_dup_handler(a=attr, vl=val):
+                def _h(v):
+                    setattr(self, a, v/100); vl.setText(f"{v/100:.2f}")
+                    for r in self.results: r.pop("has_duplicate", None)
+                    self._populate_list()
+                    self._save_prefs()
+                return _h
+            sl.valueChanged.connect(_make_dup_handler())
+            r2.addWidget(lbl); r2.addWidget(sl); r2.addWidget(val)
 
-        row3 = QHBoxLayout(); row3.setSpacing(6)
-        zip_lbl = QLabel("📦 TXT 압축:")
-        zip_lbl.setStyleSheet("color:#aaa; font-size:11px;")
+        r2.addWidget(_vsep())
+
+        zip_lbl = QLabel("📦 압축:")
+        zip_lbl.setStyleSheet("color:#aaa;font-size:11px;")
         self.zip_name_edit = QLineEdit()
-        self.zip_name_edit.setPlaceholderText("파일명 (폴더 선택 시 자동 입력)")
+        self.zip_name_edit.setPlaceholderText("파일명")
         self.zip_name_edit.setFixedHeight(22)
+        self.zip_name_edit.setFixedWidth(110)
         self.zip_name_edit.setStyleSheet(
-            "background:#1e1e1e; color:#dcdcdc; border:1px solid #3a3a3a;"
-            "border-radius:3px; padding:1px 6px; font-size:11px;")
-        self.btn_zip_txt = _btn("압축 시작", "#5a3e8a", height=22)
+            "background:#1e1e1e;color:#dcdcdc;border:1px solid #3a3a3a;"
+            "border-radius:3px;padding:1px 4px;font-size:11px;")
+        self.btn_zip_txt = _btn("압축", "#5a3e8a", h=22, w=46)
         self.btn_zip_txt.setEnabled(False)
         self.btn_zip_txt.clicked.connect(self._zip_txt)
-        row3.addWidget(zip_lbl)
-        row3.addWidget(self.zip_name_edit)
-        row3.addWidget(self.btn_zip_txt)
-        tb_layout.addLayout(row3)
+        r2.addWidget(zip_lbl)
+        r2.addWidget(self.zip_name_edit)
+        r2.addWidget(self.btn_zip_txt)
+        r2.addWidget(_vsep())
+
+        btn_reset_prefs = QPushButton("⟳ 설정 초기화")
+        btn_reset_prefs.setFixedHeight(22)
+        btn_reset_prefs.setStyleSheet(
+            "QPushButton{background:#3a3a3a;color:#aaa;border:1px solid #555;"
+            "border-radius:3px;font-size:10px;padding:0 6px;}"
+            "QPushButton:hover{background:#555;color:#fff;}")
+        btn_reset_prefs.clicked.connect(self._reset_prefs)
+        r2.addWidget(btn_reset_prefs)
+        r2.addWidget(_vsep())
+
+        self.status_label = QLabel("준비")
+        self.status_label.setStyleSheet("color:#aaa;font-size:11px;")
+        self.progress_bar = QProgressBar()
+        self.progress_bar.setFixedHeight(12)
+        self.progress_bar.setFixedWidth(150)
+        self.progress_bar.setVisible(False)
+        r2.addWidget(self.status_label)
+        r2.addWidget(self.progress_bar)
+        r2.addStretch()
+        tbl.addLayout(r2)
 
         root.addWidget(tb)
 
         # ── 3분할 스플리터 ────────────────────────────────────────────────────
         splitter = QSplitter(Qt.Horizontal)
         splitter.setHandleWidth(4)
-        root.addWidget(splitter)
+        root.addWidget(splitter, stretch=1)
 
-        # ── 좌측 패널: 파일 목록 ─────────────────────────────────────────────
+        # ════════════════════════════════════════════════════════════════════
+        # 좌측 패널: 파일 목록
+        # ════════════════════════════════════════════════════════════════════
         left = QWidget()
         left.setMinimumWidth(200)
         left.setMaximumWidth(320)
         lv = QVBoxLayout(left)
         lv.setContentsMargins(4, 4, 4, 4)
-        lv.setSpacing(4)
+        lv.setSpacing(3)
 
-        sort_row = QHBoxLayout()
+        # 정렬
+        sort_row = QHBoxLayout(); sort_row.setSpacing(4)
         sort_lbl = QLabel("정렬:")
-        sort_lbl.setStyleSheet("color:#aaa; font-size:11px;")
+        sort_lbl.setStyleSheet("color:#aaa;font-size:11px;")
         self.sort_combo = QComboBox()
         self.sort_combo.setFixedHeight(22)
-        for k, v in [("score_asc","점수 낮은순"), ("score_desc","점수 높은순"),
-                     ("name_asc","파일명순"), ("issue_first","의심 우선"),
-                     ("dup_first","중복 우선"), ("unconfirmed","미확인 우선")]:
+        for k, v in [
+            ("name_asc",   "파일명순"),
+            ("dup_first",  "중복 우선"),
+            ("unconfirmed","미확인 우선"),
+            ("box_desc",   "박스 많은순"),
+            ("box_asc",    "박스 적은순"),
+        ]:
             self.sort_combo.addItem(v, userData=k)
         self.sort_combo.currentIndexChanged.connect(self._on_sort_changed)
         sort_row.addWidget(sort_lbl)
-        sort_row.addWidget(self.sort_combo)
+        sort_row.addWidget(self.sort_combo, stretch=1)
         lv.addLayout(sort_row)
 
-        # ── 클래스 필터 ──────────────────────────────────────────────────────
-        filter_hdr = QHBoxLayout()
+        # 클래스 필터
+        filter_hdr = QHBoxLayout(); filter_hdr.setSpacing(4)
         filter_ttl = QLabel("🔍 클래스 필터")
-        filter_ttl.setStyleSheet("color:#bbb; font-size:11px; font-weight:bold;")
+        filter_ttl.setStyleSheet("color:#bbb;font-size:11px;font-weight:bold;")
         self.btn_clear_filter = QPushButton("초기화")
-        self.btn_clear_filter.setFixedHeight(20)
-        self.btn_clear_filter.setFixedWidth(48)
+        self.btn_clear_filter.setFixedSize(46, 20)
         self.btn_clear_filter.setStyleSheet(
             "QPushButton{background:#3a3a3a;color:#aaa;border:1px solid #555;"
             "border-radius:3px;font-size:10px;padding:0;}"
@@ -734,8 +1044,7 @@ class ReviewApp(QMainWindow):
         filter_hdr.addWidget(self.btn_clear_filter)
         lv.addLayout(filter_hdr)
 
-        filter_input_row = QHBoxLayout()
-        filter_input_row.setSpacing(3)
+        filter_input_row = QHBoxLayout(); filter_input_row.setSpacing(3)
         self.filter_input = QLineEdit()
         self.filter_input.setPlaceholderText("클래스 ID (예: 0)")
         self.filter_input.setFixedHeight(22)
@@ -744,8 +1053,7 @@ class ReviewApp(QMainWindow):
             "border-radius:3px;padding:1px 4px;font-size:11px;}")
         self.filter_input.returnPressed.connect(self._add_filter_class)
         btn_add_filter = QPushButton("추가")
-        btn_add_filter.setFixedHeight(22)
-        btn_add_filter.setFixedWidth(38)
+        btn_add_filter.setFixedSize(38, 22)
         btn_add_filter.setStyleSheet(
             "QPushButton{background:#0e639c;color:#fff;border:none;"
             "border-radius:3px;font-size:11px;}"
@@ -755,12 +1063,10 @@ class ReviewApp(QMainWindow):
         filter_input_row.addWidget(btn_add_filter)
         lv.addLayout(filter_input_row)
 
-        # 활성 필터 태그 목록 (더블클릭 → 제거)
         self.filter_tag_list = QListWidget()
-        self.filter_tag_list.setMaximumHeight(88)
+        self.filter_tag_list.setMaximumHeight(80)
         self.filter_tag_list.setStyleSheet(
-            "QListWidget{background:#1e1e1e;border:1px solid #3a3a3a;"
-            "font-size:11px;}"
+            "QListWidget{background:#1e1e1e;border:1px solid #3a3a3a;font-size:11px;}"
             "QListWidget::item{padding:2px 4px;border-bottom:1px solid #2a2a2a;}"
             "QListWidget::item:selected{background:#094771;}"
             "QListWidget::item:hover{background:#2a2d2e;}")
@@ -769,44 +1075,50 @@ class ReviewApp(QMainWindow):
         lv.addWidget(self.filter_tag_list)
 
         self.filter_count_label = QLabel("")
-        self.filter_count_label.setStyleSheet(
-            "color:#569cd6; font-size:10px; padding:0 2px;")
+        self.filter_count_label.setStyleSheet("color:#569cd6;font-size:10px;padding:0 2px;")
         self.filter_count_label.setVisible(False)
         lv.addWidget(self.filter_count_label)
 
-        self.chk_cls23_eq7 = QCheckBox("(cls2 + cls3) = 7 인 이미지만")
+        self.chk_cls23_eq7 = QCheckBox("(cls2 + cls3) ≠ cls7 인 이미지만")
         self.chk_cls23_eq7.setStyleSheet(
-            "QCheckBox{color:#FFD700; font-size:11px; padding:2px 0;}"
+            "QCheckBox{color:#FFD700;font-size:11px;padding:2px 0;}"
             "QCheckBox::indicator{width:13px;height:13px;}")
         self.chk_cls23_eq7.stateChanged.connect(self._on_cls23_filter_changed)
         lv.addWidget(self.chk_cls23_eq7)
 
-        # 구분선
-        sep = QFrame()
-        sep.setFrameShape(QFrame.HLine)
-        sep.setStyleSheet("color:#3a3a3a;")
-        lv.addWidget(sep)
+        lv.addWidget(_hsep())
 
+        # 파일 목록 + 인덱스 바
         self.file_list = QListWidget()
-        self.file_list.setSelectionMode(QListWidget.SingleSelection)
+        self.file_list.setSelectionMode(QListWidget.ExtendedSelection)
         self.file_list.itemClicked.connect(self._on_list_item_clicked)
-        lv.addWidget(self.file_list)
+
+        self.box_index_bar = _BoxIndexBar()
+        self.box_index_bar.jumpRequested.connect(self._on_index_bar_jump)
+
+        list_row = QHBoxLayout()
+        list_row.setSpacing(0); list_row.setContentsMargins(0, 0, 0, 0)
+        list_row.addWidget(self.file_list, stretch=1)
+        list_row.addWidget(self.box_index_bar)
+        lv.addLayout(list_row, stretch=1)
 
         self.summary_label = QLabel("")
-        self.summary_label.setStyleSheet("color:#888; font-size:10px;")
+        self.summary_label.setStyleSheet("color:#888;font-size:10px;")
         self.summary_label.setWordWrap(True)
         lv.addWidget(self.summary_label)
         splitter.addWidget(left)
 
-        # ── 중앙 패널: 캔버스 + 슬라이더 ─────────────────────────────────────
+        # ════════════════════════════════════════════════════════════════════
+        # 중앙 패널: 캔버스
+        # ════════════════════════════════════════════════════════════════════
         center = QWidget()
-        cv_layout = QVBoxLayout(center)
-        cv_layout.setContentsMargins(0, 0, 0, 0)
-        cv_layout.setSpacing(2)
+        cv = QVBoxLayout(center)
+        cv.setContentsMargins(0, 0, 0, 0)
+        cv.setSpacing(2)
 
-        # 캔버스 상단 미니 툴바
+        # 캔버스 상단 툴바
         ctb = QHBoxLayout()
-        ctb.setContentsMargins(4, 2, 4, 2)
+        ctb.setContentsMargins(6, 3, 6, 3)
         ctb.setSpacing(4)
 
         self.confirm_btn = QPushButton("확인 (V)")
@@ -814,11 +1126,19 @@ class ReviewApp(QMainWindow):
         self.confirm_btn.setCheckable(True)
         self.confirm_btn.clicked.connect(self._toggle_confirmed)
 
-        self.minimap_btn = QPushButton("미니맵 ON (M)")
+        self.btn_merge_cur     = _btn("🔗 통합",   "#1a6b5a", h=24)
+        self.btn_rm_border_cur = _btn("✂ 테두리",  "#6b3a1a", h=24)
+        self.btn_merge_cur.clicked.connect(self._merge_current_overlapping)
+        self.btn_rm_border_cur.clicked.connect(self._remove_border_boxes_cur)
+
+        self.score_label = QLabel("")
+        self.score_label.setStyleSheet("padding:0 6px;font-weight:bold;font-size:12px;")
+
+        self.minimap_btn = QPushButton("미니맵 (M)")
         self.minimap_btn.setFixedHeight(24)
         self.minimap_btn.clicked.connect(self.toggle_minimap)
 
-        self.preview_btn = QPushButton("클래스 미리보기 (P)")
+        self.preview_btn = QPushButton("미리보기 (P)")
         self.preview_btn.setFixedHeight(24)
         self.preview_btn.clicked.connect(self.toggle_class_preview)
 
@@ -826,32 +1146,27 @@ class ReviewApp(QMainWindow):
         self.help_btn.setFixedHeight(24)
         self.help_btn.clicked.connect(self.show_guide)
 
-        self.score_label = QLabel("")
-        self.score_label.setFixedHeight(24)
-        self.score_label.setStyleSheet("padding:0 8px; font-weight:bold;")
         self.img_nav_label = QLabel("0 / 0")
-        self.img_nav_label.setStyleSheet("color:#888; font-size:11px; padding:0 8px;")
+        self.img_nav_label.setStyleSheet("color:#888;font-size:11px;padding:0 6px;")
 
-        ctb.addWidget(self.confirm_btn)
-        ctb.addWidget(self.minimap_btn)
-        ctb.addWidget(self.preview_btn)
-        ctb.addWidget(self.help_btn)
-        ctb.addWidget(self.score_label)
+        for w in [self.confirm_btn, self.btn_merge_cur, self.btn_rm_border_cur,
+                  _vsep(), self.score_label, _vsep(),
+                  self.minimap_btn, self.preview_btn, self.help_btn]:
+            ctb.addWidget(w)
         ctb.addStretch()
         ctb.addWidget(self.img_nav_label)
-        cv_layout.addLayout(ctb)
+        cv.addLayout(ctb)
 
-        # 캔버스
         self.canvas = CanvasLabel(self)
-        cv_layout.addWidget(self.canvas, stretch=1)
+        cv.addWidget(self.canvas, stretch=1)
 
         # 클래스 슬라이더
         cls_row = QHBoxLayout()
-        cls_row.setContentsMargins(4, 0, 4, 0)
+        cls_row.setContentsMargins(6, 2, 6, 2)
         cls_row.setSpacing(4)
         cls_lbl = QLabel("클래스:")
-        cls_lbl.setStyleSheet("color:#aaa; font-size:11px;")
-        cls_lbl.setFixedWidth(48)
+        cls_lbl.setStyleSheet("color:#aaa;font-size:11px;")
+        cls_lbl.setFixedWidth(46)
         self.class_slider = QSlider(Qt.Horizontal)
         self.class_slider.setMinimum(0)
         self.class_slider.setMaximum(max(self.class_count - 1, 0))
@@ -859,68 +1174,54 @@ class ReviewApp(QMainWindow):
         self.class_slider.setMaximumHeight(18)
         self.class_slider.valueChanged.connect(self._on_class_slider)
         self.class_value_label = QLabel("0")
-        self.class_value_label.setStyleSheet("color:#dcdcdc; font-size:11px; min-width:80px;")
+        self.class_value_label.setStyleSheet("color:#dcdcdc;font-size:11px;min-width:80px;")
         cls_row.addWidget(cls_lbl)
-        cls_row.addWidget(self.class_slider)
+        cls_row.addWidget(self.class_slider, stretch=1)
         cls_row.addWidget(self.class_value_label)
-        cv_layout.addLayout(cls_row)
-
+        cv.addLayout(cls_row)
         splitter.addWidget(center)
 
-        # ── 우측 패널: 정보 ───────────────────────────────────────────────────
+        # ════════════════════════════════════════════════════════════════════
+        # 우측 패널: 정보
+        # ════════════════════════════════════════════════════════════════════
         right = QWidget()
         right.setMinimumWidth(180)
-        right.setMaximumWidth(280)
+        right.setMaximumWidth(260)
         rv = QVBoxLayout(right)
         rv.setContentsMargins(6, 6, 6, 6)
-        rv.setSpacing(6)
+        rv.setSpacing(4)
 
-        def _section(title):
-            lbl = QLabel(title)
-            lbl.setStyleSheet(
-                "background:#333; color:#dcdcdc; font-weight:bold;"
-                "padding:3px 6px; border-radius:3px; font-size:11px;")
-            return lbl
-
-        rv.addWidget(_section("📊 품질 점수"))
-        self.info_score   = QLabel("—")
-        self.info_issue   = QLabel("—")
-        self.info_boxes   = QLabel("—")
-        self.info_dup     = QLabel("—")
+        rv.addWidget(_sec("📊 품질 점수"))
+        self.info_score = QLabel("—")
+        self.info_issue = QLabel("—")
+        self.info_boxes = QLabel("—")
+        self.info_dup   = QLabel("—")
         for lbl in (self.info_score, self.info_issue, self.info_boxes, self.info_dup):
-            lbl.setStyleSheet("padding:2px 6px; font-size:12px;")
-        rv.addWidget(self.info_score)
-        rv.addWidget(self.info_issue)
-        rv.addWidget(self.info_boxes)
-        rv.addWidget(self.info_dup)
+            lbl.setStyleSheet("padding:2px 6px;font-size:12px;")
+            rv.addWidget(lbl)
 
-        line = QFrame(); line.setFrameShape(QFrame.HLine)
-        line.setStyleSheet("color:#3a3a3a;")
-        rv.addWidget(line)
-
-        rv.addWidget(_section("📦 박스 목록"))
+        rv.addWidget(_hsep())
+        rv.addWidget(_sec("📦 박스 목록"))
         self.box_list = QListWidget()
-        self.box_list.setMaximumHeight(220)
+        self.box_list.setMaximumHeight(200)
         self.box_list.setStyleSheet(
             "QListWidget{background:#252526;font-size:11px;}"
             "QListWidget::item{padding:2px 4px;}")
         self.box_list.itemClicked.connect(self._on_box_list_clicked)
         rv.addWidget(self.box_list)
 
-        line2 = QFrame(); line2.setFrameShape(QFrame.HLine)
-        line2.setStyleSheet("color:#3a3a3a;")
-        rv.addWidget(line2)
-
-        rv.addWidget(_section("📋 클래스별 박스 수"))
+        rv.addWidget(_hsep())
+        rv.addWidget(_sec("📋 클래스별 박스 수"))
         self.cls_count_list = QListWidget()
         self.cls_count_list.setMaximumHeight(160)
         self.cls_count_list.setMinimumHeight(40)
-        self.cls_count_list.setFont(QFont("Courier New", 11))
+        self.cls_count_list.setFont(QFont("Courier New", 10))
         self.cls_count_list.setFocusPolicy(Qt.NoFocus)
+        self.cls_count_list.setHorizontalScrollBarPolicy(Qt.ScrollBarAlwaysOff)
         self.cls_count_list.setStyleSheet(
             "QListWidget{background:#1a1a1a;border:1px solid #333;"
             "border-radius:4px;outline:none;}"
-            "QListWidget::item{padding:2px 8px;}"
+            "QListWidget::item{padding:1px 4px;}"
             "QListWidget::item:selected{background:transparent;}")
         rv.addWidget(self.cls_count_list)
 
@@ -928,6 +1229,149 @@ class ReviewApp(QMainWindow):
         splitter.addWidget(right)
 
         splitter.setSizes([220, 1100, 220])
+
+    # ══════════════════════════════════════════════════════════════════════════
+    # 사용자 설정 영속화
+    # ══════════════════════════════════════════════════════════════════════════
+    def _load_prefs(self):
+        """저장된 설정을 읽어 UI에 반영. 오류 시 기본값 사용."""
+        import json
+        prefs = dict(_DEFAULT_PREFS)
+        if PREFS_PATH.exists():
+            try:
+                loaded = json.loads(PREFS_PATH.read_text(encoding="utf-8"))
+                if not isinstance(loaded, dict):
+                    raise ValueError("설정 파일 형식 오류")
+                prefs.update(loaded)
+            except Exception as e:
+                self.status_label.setText(f"⚠ 설정 로드 실패 (기본값 사용): {e}")
+
+        # 윈도우 크기
+        w = int(prefs.get("window_w", 1600))
+        h = int(prefs.get("window_h", 900))
+        self.resize(max(w, 1100), max(h, 650))
+
+        # Config 콤보
+        cfg_name = prefs.get("config_name")
+        if cfg_name:
+            for i in range(self.config_combo.count()):
+                if self.config_combo.itemData(i) and \
+                        self.config_combo.itemData(i).name == cfg_name:
+                    self.config_combo.blockSignals(True)
+                    self.config_combo.setCurrentIndex(i)
+                    self.config_combo.blockSignals(False)
+                    # 내부 상태도 갱신
+                    cdir = self.config_combo.itemData(i)
+                    self.current_config_dir = cdir
+                    self._num_classes  = load_class_count(cdir)
+                    self.class_names   = load_class_names_list(cdir)
+                    self.class_count   = self._num_classes
+                    self.class_slider.setMaximum(max(self.class_count - 1, 0))
+                    break
+
+        # 자동 확인 체크박스
+        self.chk_auto_confirm.blockSignals(True)
+        self.chk_auto_confirm.setChecked(bool(prefs.get("auto_confirm", True)))
+        self.chk_auto_confirm.blockSignals(False)
+
+        # 중복 슬라이더
+        for attr, key, lo, hi in [
+            ("_dup_iou",  "dup_iou",  50, 100),
+            ("_dup_area", "dup_area", 30, 100),
+        ]:
+            if key in prefs and attr in self._dup_sliders:
+                raw = int(prefs[key])
+                val = max(lo, min(hi, raw))
+                sl, lbl = self._dup_sliders[attr]
+                sl.blockSignals(True)
+                sl.setValue(val)
+                lbl.setText(f"{val/100:.2f}")
+                setattr(self, attr, val / 100)
+                sl.blockSignals(False)
+
+        # 정렬
+        sort_key = prefs.get("sort_key", "name_asc")
+        for i in range(self.sort_combo.count()):
+            if self.sort_combo.itemData(i) == sort_key:
+                self.sort_combo.blockSignals(True)
+                self.sort_combo.setCurrentIndex(i)
+                self._sort_key = sort_key
+                self.sort_combo.blockSignals(False)
+                break
+
+        # 미니맵 / 클래스 미리보기 표시 여부
+        self.show_minimap = bool(prefs.get("show_minimap", True))
+        self.minimap_btn.setText("미니맵 ON (M)" if self.show_minimap else "미니맵 OFF (M)")
+        self.show_class_preview = bool(prefs.get("show_class_preview", True))
+        self.preview_btn.setText(
+            "클래스 미리보기 ON (P)" if self.show_class_preview else "클래스 미리보기 OFF (P)")
+
+    def _save_prefs(self):
+        """현재 UI 상태를 설정 파일에 저장."""
+        import json
+        try:
+            cdir = self.config_combo.currentData()
+            prefs = {
+                "config_name": cdir.name if cdir else None,
+                "auto_confirm": self.chk_auto_confirm.isChecked(),
+                "dup_iou":  self._dup_sliders["_dup_iou"][0].value()
+                            if "_dup_iou" in self._dup_sliders else 85,
+                "dup_area": self._dup_sliders["_dup_area"][0].value()
+                            if "_dup_area" in self._dup_sliders else 75,
+                "sort_key": self._sort_key,
+                "window_w": self.width(),
+                "window_h": self.height(),
+                "show_minimap": self.show_minimap,
+                "show_class_preview": self.show_class_preview,
+            }
+            PREFS_PATH.write_text(
+                json.dumps(prefs, ensure_ascii=False, indent=2),
+                encoding="utf-8")
+        except Exception as e:
+            self.status_label.setText(f"⚠ 설정 저장 실패: {e}")
+
+    def _reset_prefs(self):
+        """설정을 기본값으로 초기화."""
+        import json
+        try:
+            if PREFS_PATH.exists():
+                PREFS_PATH.unlink()
+        except Exception as e:
+            self.status_label.setText(f"⚠ 설정 파일 삭제 실패: {e}")
+            return
+
+        # 기본값 복원
+        self.chk_auto_confirm.blockSignals(True)
+        self.chk_auto_confirm.setChecked(_DEFAULT_PREFS["auto_confirm"])
+        self.chk_auto_confirm.blockSignals(False)
+
+        for attr, key, lo, hi in [
+            ("_dup_iou",  "dup_iou",  50, 100),
+            ("_dup_area", "dup_area", 30, 100),
+        ]:
+            default_val = int(_DEFAULT_PREFS[key])
+            if attr in self._dup_sliders:
+                sl, lbl = self._dup_sliders[attr]
+                sl.blockSignals(True)
+                sl.setValue(default_val)
+                lbl.setText(f"{default_val/100:.2f}")
+                setattr(self, attr, default_val / 100)
+                sl.blockSignals(False)
+
+        default_sort = _DEFAULT_PREFS["sort_key"]
+        for i in range(self.sort_combo.count()):
+            if self.sort_combo.itemData(i) == default_sort:
+                self.sort_combo.blockSignals(True)
+                self.sort_combo.setCurrentIndex(i)
+                self._sort_key = default_sort
+                self.sort_combo.blockSignals(False)
+                break
+
+        # config는 초기화하지 않음 (의도치 않은 클래스 전환 방지)
+        for r in self.results:
+            r.pop("has_duplicate", None)
+        self._populate_list()
+        self.status_label.setText("⟳ 설정이 기본값으로 초기화되었습니다.")
 
     # ══════════════════════════════════════════════════════════════════════════
     # 설정 변경
@@ -943,28 +1387,30 @@ class ReviewApp(QMainWindow):
         self.class_slider.setMaximum(max(self.class_count - 1, 0))
         self.status_label.setText(
             f"Config 전환: {cdir.name}  ({self.class_count}개 클래스)")
+        self._save_prefs()
 
     def _on_sort_changed(self, _):
         self._sort_key = self.sort_combo.currentData()
         self._sort_results()
         self._populate_list()
         self._update_list_selection()
+        self._save_prefs()
 
     def _sort_results(self):
         k = self._sort_key
         cur_img = self.results[self.cur_idx]["img_path"] if self.results else None
-        if k == "score_asc":
-            self.results.sort(key=lambda r: r["score"])
-        elif k == "score_desc":
-            self.results.sort(key=lambda r: r["score"], reverse=True)
-        elif k == "name_asc":
+        if k == "name_asc":
             self.results.sort(key=lambda r: r["img_path"].name)
-        elif k == "issue_first":
-            self.results.sort(key=lambda r: (not r["is_issue"], r["score"]))
         elif k == "dup_first":
-            self.results.sort(key=lambda r: (not r.get("has_duplicate", False), r["score"]))
+            self.results.sort(key=lambda r: (not r.get("has_duplicate", False), r["img_path"].name))
         elif k == "unconfirmed":
-            self.results.sort(key=lambda r: (r.get("confirmed", False), r["score"]))
+            self.results.sort(key=lambda r: (r.get("confirmed", False), r["img_path"].name))
+        elif k == "box_desc":
+            self.results.sort(key=lambda r: (-r.get("box_count", 0), r["img_path"].name))
+        elif k == "box_asc":
+            self.results.sort(key=lambda r: (r.get("box_count", 0), r["img_path"].name))
+        else:
+            self.results.sort(key=lambda r: r["img_path"].name)
         # cur_idx 재계산
         if cur_img:
             for i, r in enumerate(self.results):
@@ -999,34 +1445,37 @@ class ReviewApp(QMainWindow):
                                 try: cnt[int(parts[0])] += 1
                                 except ValueError: pass
                     r["cls_counts"] = cnt
-                if r["cls_counts"].get(2, 0) + r["cls_counts"].get(3, 0) != 7:
-                    continue
+                c2 = r["cls_counts"].get(2, 0)
+                c3 = r["cls_counts"].get(3, 0)
+                c7 = r["cls_counts"].get(7, 0)
+                if c2 + c3 == 0 and c7 == 0:
+                    continue   # 관련 클래스 없는 이미지 제외
+                if c2 + c3 == c7:
+                    continue   # 정상 (cls2+cls3 == cls7)
 
-            score     = r["score"]
             confirmed = r.get("confirmed", False)
             is_issue  = r["is_issue"]
             has_dup   = r.get("has_duplicate", False)
 
-            icon = "✅" if confirmed else ("⚠️" if is_issue else "  ")
-            dup  = "🔁" if has_dup else "  "
-            sc   = f"{score:.3f}"
-            name = r["img_path"].name
-            if len(name) > 22:
-                name = name[:19] + "..."
-            text = f"{icon}{dup} {name}\n      점수: {sc}"
+            icon    = "✅" if confirmed else ("⚠️" if is_issue else "  ")
+            dup     = "🔁" if has_dup else "  "
+            bc      = r.get("box_count", 0)
+            name    = r["img_path"].name
+            if len(name) > 20:
+                name = name[:17] + "..."
+            text = f"{icon}{dup} {name}  [{bc}]"
 
             item = QListWidgetItem(text)
             item.setData(Qt.UserRole, i)   # results 인덱스 저장
 
             if confirmed:
                 item.setForeground(QColor("#4ec94e"))
-            elif is_issue:
-                item.setForeground(QColor("#e07070") if score < 0.5
-                                   else QColor("#e0a070"))
+            elif has_dup:
+                item.setForeground(QColor("#e07070"))
             else:
                 item.setForeground(QColor("#dcdcdc"))
 
-            if score < 0.5 and not confirmed:
+            if has_dup and not confirmed:
                 item.setBackground(QColor(80, 20, 20, 80))
             elif confirmed:
                 item.setBackground(QColor(20, 60, 20, 80))
@@ -1036,6 +1485,9 @@ class ReviewApp(QMainWindow):
 
         self.file_list.blockSignals(False)
 
+        # 인덱스 바 갱신
+        self._refresh_index_bar()
+
         # 필터 카운트 라벨 갱신
         if self._filter_classes or self._filter_cls23_eq7:
             self.filter_count_label.setText(
@@ -1043,6 +1495,71 @@ class ReviewApp(QMainWindow):
             self.filter_count_label.setVisible(True)
         else:
             self.filter_count_label.setVisible(False)
+
+    def _refresh_index_bar(self):
+        """박스 수 기반 iOS 연락처 스타일 인덱스 바 라벨 생성."""
+        n = self.file_list.count()
+        if n == 0:
+            self.box_index_bar.set_labels([])
+            return
+
+        # 각 row 의 box_count 수집
+        row_counts: list[tuple[int, int]] = []
+        for row in range(n):
+            item = self.file_list.item(row)
+            if item is None:
+                continue
+            idx = item.data(Qt.UserRole)
+            bc  = self.results[idx].get("box_count", 0) if idx is not None else 0
+            row_counts.append((row, bc))
+
+        # 버킷 경계 계산 (최대 MAX_LABELS 개)
+        MAX_LABELS = 20
+        counts = [c for _, c in row_counts]
+        mn, mx = min(counts), max(counts)
+
+        if mx == mn:
+            # 모두 같은 박스 수
+            self.box_index_bar.set_labels([(str(mn), 0)])
+            return
+
+        # 고유 값이 MAX_LABELS 이하면 모두 표시
+        unique_sorted = sorted(set(counts))
+        if len(unique_sorted) <= MAX_LABELS:
+            # 각 고유 count 의 첫 번째 row
+            first_row: dict[int, int] = {}
+            for row, c in row_counts:
+                if c not in first_row:
+                    first_row[c] = row
+            labels = [(str(c), first_row[c]) for c in unique_sorted]
+        else:
+            # 균등 간격 버킷
+            step = (mx - mn) / (MAX_LABELS - 1)
+            boundaries = [int(mn + step * k) for k in range(MAX_LABELS)]
+            boundaries[-1] = mx  # 마지막은 정확히 max
+
+            labels: list[tuple[str, int]] = []
+            prev_label = None
+            # row_counts 를 count 기준으로 정렬해 버킷 매핑
+            sorted_rc = sorted(row_counts, key=lambda x: x[1])
+            b_idx = 0
+            for row, c in sorted_rc:
+                while b_idx < len(boundaries) - 1 and c >= boundaries[b_idx + 1]:
+                    b_idx += 1
+                label = str(boundaries[b_idx])
+                if label != prev_label:
+                    labels.append((label, row))
+                    prev_label = label
+            # row 기준으로 재정렬 (리스트 순서와 맞추기)
+            labels.sort(key=lambda x: x[1])
+
+        self.box_index_bar.set_labels(labels)
+
+    def _on_index_bar_jump(self, row: int):
+        item = self.file_list.item(row)
+        if item:
+            self.file_list.scrollToItem(item, QListWidget.PositionAtTop)
+            self.box_index_bar.set_active(row)
 
     def _update_list_selection(self):
         if not self.results:
@@ -1058,9 +1575,13 @@ class ReviewApp(QMainWindow):
         self.file_list.blockSignals(False)
 
     def _on_list_item_clicked(self, item):
+        # 다중 선택 중이면 이미지 전환 없이 선택만 유지
+        if len(self.file_list.selectedItems()) > 1:
+            return
         idx = item.data(Qt.UserRole)
         if idx is not None and idx != self.cur_idx:
             self.save_labels()
+            self._refresh_list_item(self.cur_idx)
             self._load_image_at(idx)
 
     # ══════════════════════════════════════════════════════════════════════════
@@ -1072,20 +1593,21 @@ class ReviewApp(QMainWindow):
         self.cur_idx = idx
         r = self.results[idx]
 
-        score     = r["score"]
         is_issue  = r["is_issue"]
+        has_dup   = r.get("has_duplicate", False)
         confirmed = r.get("confirmed", False)
-        issue_str = "⚠️ 의심" if is_issue else "✅ 정상"
+        box_count = r.get("box_count", 0)
+        issue_str = "⚠️ 중복" if has_dup else "✅ 정상"
         conf_str  = "  ✅ 확인됨" if confirmed else ""
         self.setWindowTitle(
             f"검수 - {r['img_path'].name}  [{idx+1}/{len(self.results)}]"
-            f"  점수: {score:.4f}  {issue_str}{conf_str}"
+            f"  박스: {box_count}  {issue_str}{conf_str}"
         )
         self.img_nav_label.setText(f"{idx+1} / {len(self.results)}")
 
-        sc_color = "#e07070" if score < 0.5 else ("#e0a070" if score < 0.8 else "#4ec94e")
+        dup_color = "#e07070" if has_dup else "#4ec94e"
         self.score_label.setText(
-            f"<span style='color:{sc_color}'>점수: {score:.4f}</span>  {issue_str}")
+            f"<span style='color:{dup_color}'>{issue_str}</span>  박스: {box_count}")
 
         self.confirm_btn.blockSignals(True)
         self.confirm_btn.setChecked(confirmed)
@@ -1109,12 +1631,16 @@ class ReviewApp(QMainWindow):
         self.reset_zoom()
 
         if "has_duplicate" not in r:
-            r["has_duplicate"] = compute_has_duplicate(r["txt_path"])
+            r["has_duplicate"] = compute_has_duplicate(r["txt_path"], self._dup_iou, self._dup_area)
 
         self._update_right_panel()
         self._update_list_selection()
         # 목록 항목 아이콘 갱신 (로드 후 dup 계산 완료)
         self._refresh_list_item(idx)
+        # 인덱스 바 active 갱신
+        row = self._current_list_row()
+        if row >= 0:
+            self.box_index_bar.set_active(row)
 
     def _current_list_row(self) -> int:
         """현재 cur_idx 에 해당하는 file_list 행 번호 반환 (-1 = 없음)."""
@@ -1128,19 +1654,23 @@ class ReviewApp(QMainWindow):
         row = self._current_list_row()
         if row > 0:
             self.save_labels()
+            self._refresh_list_item(self.cur_idx)
             prev_idx = self.file_list.item(row - 1).data(Qt.UserRole)
             self._load_image_at(prev_idx)
         elif self.results:
             self.save_labels()
+            self._refresh_list_item(self.cur_idx)
 
     def _navigate_next(self):
         row = self._current_list_row()
         if row >= 0 and row < self.file_list.count() - 1:
             self.save_labels()
+            self._refresh_list_item(self.cur_idx)
             next_idx = self.file_list.item(row + 1).data(Qt.UserRole)
             self._load_image_at(next_idx)
         elif self.results:
             self.save_labels()
+            self._refresh_list_item(self.cur_idx)
 
     # ── 클래스 필터 메서드 ──────────────────────────────────────────────────
     def _add_filter_class(self):
@@ -1205,16 +1735,16 @@ class ReviewApp(QMainWindow):
         if idx < 0 or idx >= len(self.results):
             return
         r = self.results[idx]
-        score     = r["score"]
         confirmed = r.get("confirmed", False)
         is_issue  = r["is_issue"]
         has_dup   = r.get("has_duplicate", False)
         icon = "✅" if confirmed else ("⚠️" if is_issue else "  ")
         dup  = "🔁" if has_dup else "  "
+        bc   = r.get("box_count", 0)
         name = r["img_path"].name
-        if len(name) > 22:
-            name = name[:19] + "..."
-        text = f"{icon}{dup} {name}\n      점수: {score:.3f}"
+        if len(name) > 20:
+            name = name[:17] + "..."
+        text = f"{icon}{dup} {name}  [{bc}]"
         # 필터 적용 시 list widget 행 번호 ≠ results 인덱스 → UserRole로 검색
         target_item = None
         for row in range(self.file_list.count()):
@@ -1228,9 +1758,9 @@ class ReviewApp(QMainWindow):
             if confirmed:
                 target_item.setForeground(QColor("#4ec94e"))
                 target_item.setBackground(QColor(20, 60, 20, 80))
-            elif is_issue:
-                target_item.setForeground(QColor("#e07070") if score < 0.5 else QColor("#e0a070"))
-                target_item.setBackground(QColor(80, 20, 20, 80) if score < 0.5 else QColor())
+            elif has_dup:
+                target_item.setForeground(QColor("#e07070"))
+                target_item.setBackground(QColor(80, 20, 20, 80))
             else:
                 target_item.setForeground(QColor("#dcdcdc"))
                 target_item.setBackground(QColor())
@@ -1243,17 +1773,16 @@ class ReviewApp(QMainWindow):
         if not self.results or self.cur_idx >= len(self.results):
             return
         r = self.results[self.cur_idx]
-        score     = r["score"]
         confirmed = r.get("confirmed", False)
-        is_issue  = r["is_issue"]
         has_dup   = r.get("has_duplicate", False)
+        box_count = r.get("box_count", 0)
 
-        sc_color = "#e07070" if score < 0.5 else ("#e0a070" if score < 0.8 else "#4ec94e")
+        bc_color = "#4ec94e" if not has_dup else "#e07070"
         self.info_score.setText(
-            f"<span style='color:{sc_color}; font-size:14px;'><b>{score:.4f}</b></span>")
-        self.info_issue.setText("⚠️ <span style='color:#e07070;'>의심 라벨</span>" if is_issue
-                                else "✅ <span style='color:#4ec94e;'>정상</span>")
-        self.info_boxes.setText(f"박스 수: <b>{r['box_count']}</b>")
+            f"<span style='color:{bc_color}; font-size:14px;'><b>박스 {box_count}개</b></span>")
+        self.info_issue.setText("🔁 <span style='color:#e07070;'>중복 있음</span>" if has_dup
+                                else "✅ <span style='color:#4ec94e;'>중복 없음</span>")
+        self.info_boxes.setText(f"박스 수: <b>{box_count}</b>")
         self.info_dup.setText("🔁 <span style='color:#e09000;'>중복 있음</span>" if has_dup
                               else "<span style='color:#888;'>중복 없음</span>")
 
@@ -1277,7 +1806,8 @@ class ReviewApp(QMainWindow):
         cnt = Counter(cls for cls, *_ in self.boxes)
         for cls in sorted(cnt):
             name = self.class_names[cls] if cls < len(self.class_names) else "?"
-            item = QListWidgetItem(f"[{cls:2d}]  {name:<16}  × {cnt[cls]}")
+            name_s = name[:12] if len(name) > 12 else name
+            item = QListWidgetItem(f"[{cls:2d}] {name_s:<12} ×{cnt[cls]}")
             item.setForeground(get_color_for_class(cls))
             self.cls_count_list.addItem(item)
 
@@ -1306,7 +1836,7 @@ class ReviewApp(QMainWindow):
                 bh = (ry2 - ry1) / self.h
                 f.write(f"{cls} {xc:.8f} {yc:.8f} {bw:.8f} {bh:.8f}\n")
         r["box_count"] = len(self.boxes)
-        r["has_duplicate"] = compute_has_duplicate(path)
+        r["has_duplicate"] = compute_has_duplicate(path, self._dup_iou, self._dup_area)
         r.pop("class_ids", None)   # 클래스 변경 가능 → 캐시 무효화
         print(f"✅ 저장: {path.name}")
 
@@ -1346,11 +1876,13 @@ class ReviewApp(QMainWindow):
         self.results[self.cur_idx]["confirmed"] = confirmed
         self._apply_confirm_style(confirmed)
         r = self.results[self.cur_idx]
-        issue_str = "⚠️ 의심" if r["is_issue"] else "✅ 정상"
+        has_dup   = r.get("has_duplicate", False)
+        box_count = r.get("box_count", 0)
+        issue_str = "⚠️ 중복" if has_dup else "✅ 정상"
         conf_str  = "  ✅ 확인됨" if confirmed else ""
         self.setWindowTitle(
             f"검수 - {r['img_path'].name}  [{self.cur_idx+1}/{len(self.results)}]"
-            f"  점수: {r['score']:.4f}  {issue_str}{conf_str}"
+            f"  박스: {box_count}  {issue_str}{conf_str}"
         )
         self._update_right_panel()
         self._refresh_list_item(self.cur_idx)
@@ -1375,7 +1907,8 @@ class ReviewApp(QMainWindow):
         cw, ch = self.canvas.width(), self.canvas.height()
         if cw <= 0 or ch <= 0 or self.w <= 0 or self.h <= 0:
             return
-        self.zoom = min(cw / self.w, ch / self.h)
+        self._fit_zoom = min(cw / self.w, ch / self.h)
+        self.zoom = self._fit_zoom
         self.offset = QPoint(
             (cw - int(self.w * self.zoom)) // 2,
             (ch - int(self.h * self.zoom)) // 2,
@@ -1443,7 +1976,8 @@ class ReviewApp(QMainWindow):
                 cj, x1j, y1j, x2j, y2j = self.boxes[j]
                 if ci == cj:
                     continue
-                if _is_same_box_pair(x1i, y1i, x2i, y2i, x1j, y1j, x2j, y2j):
+                if _is_same_box_pair(x1i, y1i, x2i, y2i, x1j, y1j, x2j, y2j,
+                                     self._dup_iou, self._dup_area):
                     dups.add(i)
                     dups.add(j)
         return dups
@@ -1454,7 +1988,8 @@ class ReviewApp(QMainWindow):
     def _canvas_mouse_press(self, event):
         pos = event.pos()
 
-        if event.modifiers() == Qt.ControlModifier and event.button() == Qt.LeftButton:
+        if ((event.modifiers() == Qt.ControlModifier and event.button() == Qt.LeftButton)
+                or event.button() == Qt.MiddleButton):
             self.panning = True
             self.pan_start_pos = pos
             self.canvas.setCursor(Qt.ClosedHandCursor)
@@ -1572,7 +2107,7 @@ class ReviewApp(QMainWindow):
             self._update_right_panel()
             return
 
-        if event.button() == Qt.LeftButton and self.panning:
+        if event.button() in (Qt.LeftButton, Qt.MiddleButton) and self.panning:
             self.panning = False
             self.canvas.setCursor(Qt.ArrowCursor)
             return
@@ -1636,7 +2171,8 @@ class ReviewApp(QMainWindow):
                       else max(self.current_class-1, 0))
                 self.class_slider.setValue(nc)
         elif dy != 0:
-            new_zoom = min(self.zoom * 1.1, 20.0) if dy > 0 else max(self.zoom * 0.9, 0.1)
+            fit = getattr(self, "_fit_zoom", self.zoom)
+            new_zoom = min(self.zoom * 1.1, fit * 2.5) if dy > 0 else max(self.zoom * 0.9, fit)
             old_pos  = pos - self.offset
             rx = old_pos.x() / (self.w * self.zoom)
             ry = old_pos.y() / (self.h * self.zoom)
@@ -1653,8 +2189,20 @@ class ReviewApp(QMainWindow):
     def keyPressEvent(self, event):
         self._handle_key(event)
 
+    # macOS 가상 키코드 → Qt 키 매핑 (한글 IME 활성 시 key() 값이 깨짐)
+    _MAC_VK_MAP = {
+        0x00: Qt.Key_A, 0x01: Qt.Key_S, 0x02: Qt.Key_D, 0x03: Qt.Key_F,
+        0x04: Qt.Key_H, 0x06: Qt.Key_Z, 0x08: Qt.Key_C, 0x09: Qt.Key_V,
+        0x0F: Qt.Key_R, 0x20: Qt.Key_U, 0x23: Qt.Key_P, 0x2E: Qt.Key_M,
+        0x24: Qt.Key_Return, 0x33: Qt.Key_Backspace,
+        0x7B: Qt.Key_Left, 0x7C: Qt.Key_Right,
+    }
+
     def _handle_key(self, event):
         key = event.key()
+        # 한글 IME 활성 시 key()가 Qt.Key_unknown(0x1000000)으로 오는 경우 보정
+        if key == Qt.Key_unknown or key == 0:
+            key = self._MAC_VK_MAP.get(event.nativeVirtualKey(), Qt.Key_unknown)
 
         if key == Qt.Key_S:
             self.save_labels()
@@ -1684,8 +2232,11 @@ class ReviewApp(QMainWindow):
             self.redo_action()
 
         elif key == Qt.Key_V:
-            self.confirm_btn.setChecked(not self.confirm_btn.isChecked())
-            self._toggle_confirmed()
+            if len(self.file_list.selectedItems()) > 1:
+                self._confirm_selected_items()
+            else:
+                self.confirm_btn.setChecked(not self.confirm_btn.isChecked())
+                self._toggle_confirmed()
 
         elif key == Qt.Key_Backspace:
             if self.selected_boxes:
@@ -1788,12 +2339,14 @@ class ReviewApp(QMainWindow):
     def toggle_minimap(self):
         self.show_minimap = not self.show_minimap
         self.minimap_btn.setText("미니맵 ON (M)" if self.show_minimap else "미니맵 OFF (M)")
+        self._save_prefs()
         self.update_display()
 
     def toggle_class_preview(self):
         self.show_class_preview = not self.show_class_preview
         self.preview_btn.setText(
             "클래스 미리보기 ON (P)" if self.show_class_preview else "클래스 미리보기 OFF (P)")
+        self._save_prefs()
         self.update_display()
 
     # ══════════════════════════════════════════════════════════════════════════
@@ -1969,19 +2522,6 @@ class ReviewApp(QMainWindow):
             painter.setPen(QPen(QColor(100, 100, 100)))
             painter.drawText(QRectF(px, py, size, size), Qt.AlignCenter,
                              f"No image\n({self.current_class}.png)")
-        cls = self.current_class
-        cc  = get_color_for_class(cls)
-        lr  = QRectF(px-5, py+size+5, size+10, 22)
-        painter.fillRect(lr, QColor(0, 0, 0, 180))
-        painter.setPen(Qt.NoPen)
-        painter.setBrush(QBrush(cc))
-        painter.drawEllipse(QPointF(px+10, py+size+16), 5, 5)
-        painter.setBrush(Qt.NoBrush)
-        painter.setPen(QPen(QColor(220, 220, 220)))
-        lbl = f"Class {cls}"
-        if cls < len(self.class_names):
-            lbl += f": {self.class_names[cls]}"
-        painter.drawText(QRectF(px+20, py+size+5, size-15, 22), Qt.AlignVCenter, lbl)
 
     # ══════════════════════════════════════════════════════════════════════════
     # 폴더 선택 / 검수
@@ -1999,6 +2539,12 @@ class ReviewApp(QMainWindow):
         self.btn_zip_txt.setEnabled(True)
         self.zip_name_edit.setText(self.selected_folder.name)
         self.results = []
+        self.cur_idx = 0
+        self.boxes = []
+        self.modified_boxes.clear()
+        self.selected_boxes.clear()
+        self.undo_stack.clear()
+        self.redo_stack.clear()
         self.file_list.clear()
         self.summary_label.setText("")
 
@@ -2078,16 +2624,13 @@ class ReviewApp(QMainWindow):
     def _start_review(self):
         if not self.selected_folder:
             return
-        if not MODEL_PATH.exists():
-            QMessageBox.critical(self, "오류", f"모델 없음:\n{MODEL_PATH}")
-            return
         self.btn_review.setEnabled(False)
         self.results = []
         self.file_list.clear()
         self.progress_bar.setVisible(True)
         self.progress_bar.setValue(0)
 
-        self.worker = ReviewWorker(self.selected_folder, self._num_classes,
+        self.worker = ReviewWorker(self.selected_folder,
                                    auto_confirm=self.chk_auto_confirm.isChecked())
         self.worker.progress.connect(self._on_progress)
         self.worker.status_msg.connect(lambda m: self.status_label.setText(m))
@@ -2112,7 +2655,7 @@ class ReviewApp(QMainWindow):
         self.btn_partial.setEnabled(False)
         self.progress_bar.setVisible(True)
         self.progress_bar.setValue(0)
-        self.worker = ReviewWorker(self.selected_folder, self._num_classes,
+        self.worker = ReviewWorker(self.selected_folder,
                                    file_filter=modified,
                                    auto_confirm=self.chk_auto_confirm.isChecked())
         self.worker.progress.connect(self._on_progress)
@@ -2130,7 +2673,7 @@ class ReviewApp(QMainWindow):
         self.btn_review.setEnabled(False)
         self.btn_rev_sel.setEnabled(False)
         self.progress_bar.setVisible(True)
-        self.worker = ReviewWorker(self.selected_folder, self._num_classes,
+        self.worker = ReviewWorker(self.selected_folder,
                                    file_filter=file_filter,
                                    auto_confirm=self.chk_auto_confirm.isChecked())
         self.worker.progress.connect(self._on_progress)
@@ -2141,10 +2684,16 @@ class ReviewApp(QMainWindow):
     def _on_progress(self, cur, total):
         self.progress_bar.setMaximum(total)
         self.progress_bar.setValue(cur)
-        self.status_label.setText(f"추론 중... {cur} / {total}")
+        self.status_label.setText(f"스캔 중... {cur} / {total}")
 
     def _on_finished(self, results, from_cache=False):
         self.results = results
+        self.cur_idx = 0
+        self.boxes = []
+        self.modified_boxes.clear()
+        self.selected_boxes.clear()
+        self.undo_stack.clear()
+        self.redo_stack.clear()
         self.progress_bar.setVisible(False)
         self.btn_review.setEnabled(True)
 
@@ -2154,7 +2703,7 @@ class ReviewApp(QMainWindow):
         # dup 미리 계산
         for r in self.results:
             if "has_duplicate" not in r:
-                r["has_duplicate"] = compute_has_duplicate(r["txt_path"])
+                r["has_duplicate"] = compute_has_duplicate(r["txt_path"], self._dup_iou, self._dup_area)
 
         self._sort_results()
         self._populate_list()
@@ -2163,6 +2712,8 @@ class ReviewApp(QMainWindow):
         self.btn_confirm_all.setEnabled(has)
         self.btn_confirm_sel.setEnabled(has)
         self.btn_unconfirm_all.setEnabled(has)
+        self.btn_merge_all.setEnabled(has)
+        self.btn_rm_border_all.setEnabled(has)
         self._refresh_dup_btn()
         self._refresh_partial_btn()
         self._update_summary()
@@ -2193,7 +2744,7 @@ class ReviewApp(QMainWindow):
         self.results = merged
         for r in self.results:
             if "has_duplicate" not in r:
-                r["has_duplicate"] = compute_has_duplicate(r["txt_path"])
+                r["has_duplicate"] = compute_has_duplicate(r["txt_path"], self._dup_iou, self._dup_area)
         save_cache(self.selected_folder, self.results)
         self._sort_results()
         self._populate_list()
@@ -2217,7 +2768,7 @@ class ReviewApp(QMainWindow):
                 self.results[i]["selected"] = was_sel
         for r in self.results:
             if "has_duplicate" not in r:
-                r["has_duplicate"] = compute_has_duplicate(r["txt_path"])
+                r["has_duplicate"] = compute_has_duplicate(r["txt_path"], self._dup_iou, self._dup_area)
         save_cache(self.selected_folder, self.results)
         self._sort_results()
         self._populate_list()
@@ -2278,22 +2829,165 @@ class ReviewApp(QMainWindow):
             self.confirm_btn.blockSignals(False)
 
     def _confirm_selected_items(self):
-        """현재 이미지만 확인 처리 (좌측 목록 선택 행 없으므로 cur_idx 기준)."""
+        """좌측 목록에서 선택된 항목 전부를 확인 처리."""
         if not self.results:
             return
-        r = self.results[self.cur_idx]
-        r["confirmed"] = True
-        self.confirm_btn.blockSignals(True)
-        self.confirm_btn.setChecked(True)
-        self._apply_confirm_style(True)
-        self.confirm_btn.blockSignals(False)
+        selected = self.file_list.selectedItems()
+        if not selected:
+            return
+        for item in selected:
+            idx = item.data(Qt.UserRole)
+            if idx is not None:
+                self.results[idx]["confirmed"] = True
+                self._refresh_list_item(idx)
+        # 현재 이미지가 포함된 경우 우측 패널 갱신
+        cur_item_idxs = {i.data(Qt.UserRole) for i in selected}
+        if self.cur_idx in cur_item_idxs:
+            self.confirm_btn.blockSignals(True)
+            self.confirm_btn.setChecked(True)
+            self._apply_confirm_style(True)
+            self.confirm_btn.blockSignals(False)
         save_cache(self.selected_folder, self.results)
-        self._refresh_list_item(self.cur_idx)
         self._update_summary()
 
     # ══════════════════════════════════════════════════════════════════════════
     # 중복 박스 일괄 제거
     # ══════════════════════════════════════════════════════════════════════════
+    # ══════════════════════════════════════════════════════════════════════════
+    # 너비 겹침 박스 통합
+    # ══════════════════════════════════════════════════════════════════════════
+    def _merge_current_overlapping(self):
+        """현재 이미지의 너비 50% 이상 겹치는 박스를 외곽 바운딩박스로 합침."""
+        if not self.results:
+            return
+        before = len(self.boxes)
+        merged = _merge_width_overlapping_boxes(self.boxes)
+        if len(merged) == before:
+            self.status_label.setText("통합할 겹치는 박스가 없습니다.")
+            return
+        self._push_undo_state()
+        self.boxes = merged
+        self.modified_boxes.clear()
+        self.selected_boxes.clear()
+        self.save_labels()
+        self.update_display()
+        self._update_right_panel()
+        self.status_label.setText(
+            f"통합 완료: {before}개 → {len(merged)}개 (-{before - len(merged)}개)")
+
+    def _merge_all_overlapping(self):
+        """전체 이미지에 너비 겹침 박스 통합 일괄 적용."""
+        if not self.results:
+            return
+        reply = QMessageBox.question(
+            self, "전체 중복 통합",
+            f"전체 {len(self.results)}개 이미지에 너비 50% 이상 겹치는 박스를 "
+            f"외곽 바운딩박스로 통합합니다.\n계속하시겠습니까?",
+            QMessageBox.Yes | QMessageBox.No)
+        if reply != QMessageBox.Yes:
+            return
+
+        total_merged = 0
+        affected = 0
+        cur_r = self.results[self.cur_idx] if self.results else None
+
+        for i, r in enumerate(self.results):
+            if i == self.cur_idx:
+                # 현재 이미지는 메모리에서 바로 merge → 한 번만 저장
+                before = len(self.boxes)
+                merged = _merge_width_overlapping_boxes(self.boxes)
+                removed = before - len(merged)
+                if removed:
+                    self.boxes = merged
+                    self.modified_boxes.clear()
+                    self.selected_boxes.clear()
+                    self.save_labels()   # 통합 결과 저장 1회
+                    total_merged += removed
+                    affected += 1
+                    r["box_count"] = len(merged)
+                    r.pop("has_duplicate", None)
+                    r.pop("cls_counts", None)
+            else:
+                removed = _merge_width_overlapping_txt(r["txt_path"])
+                if removed:
+                    total_merged += removed
+                    affected += 1
+                    r["box_count"] = max(0, r.get("box_count", 0) - removed)
+                    r.pop("has_duplicate", None)
+                    r.pop("cls_counts", None)
+
+        self.update_display()
+        self._update_right_panel()
+
+        save_cache(self.selected_folder, self.results)
+        self._populate_list()
+        self.status_label.setText(
+            f"전체 통합 완료: {affected}개 이미지, 총 {total_merged}개 박스 감소")
+
+    def _remove_border_boxes_cur(self):
+        """현재 이미지의 테두리 소형 박스 제거."""
+        if not self.results:
+            return
+        before = len(self.boxes)
+        new_boxes, removed = _remove_border_small_boxes(self.boxes, self.w, self.h)
+        if not removed:
+            self.status_label.setText("제거할 테두리 박스가 없습니다.")
+            return
+        self._push_undo_state()
+        self.boxes = new_boxes
+        self.modified_boxes.clear()
+        self.selected_boxes.clear()
+        self.save_labels()
+        self.update_display()
+        self._update_right_panel()
+        self.status_label.setText(
+            f"테두리 박스 제거: {before}개 → {len(self.boxes)}개 (-{removed}개)")
+
+    def _remove_border_boxes_all(self):
+        """전체 이미지에서 테두리 소형 박스 일괄 제거."""
+        if not self.results:
+            return
+        reply = QMessageBox.question(
+            self, "테두리 박스 전체 제거",
+            f"전체 {len(self.results)}개 이미지에서 테두리에 걸친 소형 박스를 제거합니다.\n"
+            f"(기준: 내부 박스 평균 면적의 50% 미만)\n계속하시겠습니까?",
+            QMessageBox.Yes | QMessageBox.No)
+        if reply != QMessageBox.Yes:
+            return
+
+        total_removed = 0
+        affected = 0
+        for i, r in enumerate(self.results):
+            if i == self.cur_idx:
+                before = len(self.boxes)
+                new_boxes, removed = _remove_border_small_boxes(
+                    self.boxes, self.w, self.h)
+                if removed:
+                    self.boxes = new_boxes
+                    self.modified_boxes.clear()
+                    self.selected_boxes.clear()
+                    self.save_labels()
+                    total_removed += removed
+                    affected += 1
+                    r["box_count"] = len(self.boxes)
+                    r.pop("cls_counts", None)
+                    r.pop("has_duplicate", None)
+            else:
+                removed = _remove_border_small_boxes_txt(r["txt_path"])
+                if removed:
+                    total_removed += removed
+                    affected += 1
+                    r["box_count"] = max(0, r.get("box_count", 0) - removed)
+                    r.pop("cls_counts", None)
+                    r.pop("has_duplicate", None)
+
+        self.update_display()
+        self._update_right_panel()
+        save_cache(self.selected_folder, self.results)
+        self._populate_list()
+        self.status_label.setText(
+            f"테두리 박스 제거 완료: {affected}개 이미지, 총 {total_removed}개 박스 제거")
+
     def _remove_all_duplicates(self):
         dup_results = [r for r in self.results if r.get("has_duplicate", False)]
         if not dup_results:
@@ -2310,7 +3004,7 @@ class ReviewApp(QMainWindow):
         for r in dup_results:
             n = remove_duplicates_from_txt(r["txt_path"])
             total_removed += n
-            r["has_duplicate"] = compute_has_duplicate(r["txt_path"])
+            r["has_duplicate"] = compute_has_duplicate(r["txt_path"], self._dup_iou, self._dup_area)
             if r["txt_path"].exists():
                 r["box_count"] = sum(
                     1 for line in r["txt_path"].read_text().strip().splitlines()
@@ -2343,13 +3037,11 @@ class ReviewApp(QMainWindow):
             self.summary_label.setText("")
             return
         n  = len(self.results)
-        ni = sum(r["is_issue"]                 for r in self.results)
         nc = sum(r.get("confirmed", False)     for r in self.results)
         nd = sum(r.get("has_duplicate", False) for r in self.results)
-        av = sum(r["score"]                    for r in self.results) / n
         self.summary_label.setText(
-            f"총 {n}개  |  의심 {ni}  |  중복 {nd}\n"
-            f"확인 {nc}/{n}  |  평균 {av:.3f}")
+            f"총 {n}개  |  중복 {nd}\n"
+            f"확인 {nc}/{n}")
 
     # ══════════════════════════════════════════════════════════════════════════
     # 도움말
@@ -2393,6 +3085,7 @@ class ReviewApp(QMainWindow):
     # ══════════════════════════════════════════════════════════════════════════
     def closeEvent(self, event):
         self.save_labels()
+        self._save_prefs()
         super().closeEvent(event)
 
 
