@@ -2445,25 +2445,6 @@ class ReviewApp(QMainWindow):
         self._draw_minimap(painter)
         self._draw_class_preview(painter)
 
-        # 현재 클래스 오버레이 (좌상단)
-        cls  = self.current_class
-        cc   = get_color_for_class(cls)
-        lbl  = f"Class {cls}"
-        if cls < len(self.class_names):
-            lbl += f": {self.class_names[cls]}"
-        or_  = QRectF(8, 8, 220, 30)
-        painter.fillRect(or_, QColor(0, 0, 0, 160))
-        painter.setPen(QPen(QColor(80, 80, 80), 1))
-        painter.drawRect(or_)
-        fnt2 = painter.font(); fnt2.setPointSize(10); fnt2.setBold(True)
-        painter.setFont(fnt2)
-        painter.setPen(Qt.NoPen)
-        painter.setBrush(QBrush(cc))
-        painter.drawEllipse(QPointF(24, 23), 7, 7)
-        painter.setBrush(Qt.NoBrush)
-        painter.setPen(QPen(QColor(220, 220, 220)))
-        painter.drawText(or_.adjusted(40, 0, 0, 0), Qt.AlignVCenter, lbl)
-
         painter.end()
         self.canvas.setPixmap(pix)
 
