@@ -1,11 +1,11 @@
 {
-  "config_name": "config_bird",
+  "config_name": "config",
   "auto_confirm": false,
   "dup_iou": 85,
   "dup_area": 75,
   "sort_key": "box_asc",
-  "window_w": 1440,
-  "window_h": 920,
+  "window_w": 1920,
+  "window_h": 1027,
   "show_minimap": false,
   "show_class_preview": false
 }

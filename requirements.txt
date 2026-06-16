@@ -8,3 +8,4 @@ pyyaml
 pillow
 tqdm
 cleanlab
+opencv-python

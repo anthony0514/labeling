@@ -20,7 +20,8 @@ from PyQt5.QtWidgets import (
     QApplication, QMainWindow, QWidget, QVBoxLayout, QHBoxLayout,
     QPushButton, QLabel, QFileDialog, QProgressBar, QMessageBox,
     QSlider, QSizePolicy, QListWidget, QListWidgetItem, QSplitter,
-    QComboBox, QCheckBox, QScrollArea, QFrame, QLineEdit
+    QComboBox, QCheckBox, QScrollArea, QFrame, QLineEdit, QDialog,
+    QDialogButtonBox
 )
 from PyQt5.QtGui import (
     QPixmap, QImage, QColor, QPainter, QPen, QBrush, QCursor, QFont
@@ -34,6 +35,7 @@ DATASET_YAML = PROJECT_ROOT / "dataset.yaml"
 CONFIG_DIR   = SCRIPT_DIR / "config"
 REFS_DIR     = SCRIPT_DIR / "refs"
 PREFS_PATH   = SCRIPT_DIR / ".review_prefs.json"
+SOURCES_DIR  = SCRIPT_DIR / "sources"
 
 # ── 기본 사용자 설정 ──────────────────────────────────────────────────────────
 _DEFAULT_PREFS: dict = {
@@ -237,8 +239,8 @@ def _is_same_box_pair(x1i, y1i, x2i, y2i, x1j, y1j, x2j, y2j,
     return (min(ai, aj) / max(ai, aj)) >= area_ratio_thresh
 
 
-def _merge_width_overlapping_boxes(boxes, thresh=0.5):
-    """너비 50% 이상 겹치는 박스를 외곽 바운딩박스로 합침.
+def _merge_width_overlapping_boxes_once(boxes, thresh=0.5):
+    """너비 50% 이상 겹치는 박스를 외곽 바운딩박스로 합침 — 1패스.
     boxes: list of (cls, x1, y1, x2, y2) pixel coords
     Returns: new list (merged where needed).
     """
@@ -295,74 +297,101 @@ def _merge_width_overlapping_boxes(boxes, thresh=0.5):
     return result
 
 
+def _merge_width_overlapping_boxes(boxes, thresh=0.5):
+    """통합 후 새로 생긴 큰 박스가 다시 겹칠 수 있으므로,
+    변화가 없을 때까지 반복 적용한다."""
+    current = list(boxes)
+    while True:
+        next_ = _merge_width_overlapping_boxes_once(current, thresh)
+        if len(next_) == len(current):
+            return next_
+        current = next_
+
+
 def _merge_width_overlapping_txt(txt_path: Path, thresh=0.5) -> int:
-    """YOLO txt 파일에서 너비 겹침 박스를 직접 병합 저장. 변경된 박스 수 반환."""
+    """YOLO txt 파일에서 너비 겹침 박스를 직접 병합 저장.
+    통합 후 새로 커진 박스가 다시 겹칠 수 있으므로 변화가 없을 때까지 반복.
+    반환: 원본 대비 줄어든 박스 수."""
     if not txt_path.exists():
         return 0
-    raw = []
-    for line in txt_path.read_text().strip().splitlines():
-        parts = line.strip().split()
-        if len(parts) == 5:
-            cls = int(parts[0])
-            cx, cy, w, h = map(float, parts[1:])
-            raw.append((cls, cx - w/2, cy - h/2, cx + w/2, cy + h/2))
 
-    from collections import defaultdict
-    n = len(raw)
-    if n < 2:
-        return 0
-    parent = list(range(n))
+    def _parse(path):
+        boxes = []
+        for line in path.read_text().strip().splitlines():
+            parts = line.strip().split()
+            if len(parts) == 5:
+                cls = int(parts[0])
+                cx, cy, w, h = map(float, parts[1:])
+                boxes.append((cls, cx - w/2, cy - h/2, cx + w/2, cy + h/2))
+        return boxes
 
-    def find(i):
-        while parent[i] != i:
-            parent[i] = parent[parent[i]]
-            i = parent[i]
-        return i
+    def _one_pass(raw):
+        from collections import defaultdict
+        n = len(raw)
+        if n < 2:
+            return raw, 0
+        parent = list(range(n))
 
-    for i in range(n):
-        _, x1i, y1i, x2i, y2i = raw[i]
-        area_i = (x2i - x1i) * (y2i - y1i)
-        for j in range(i + 1, n):
-            _, x1j, y1j, x2j, y2j = raw[j]
-            area_j = (x2j - x1j) * (y2j - y1j)
-            inter_x = max(0.0, min(x2i, x2j) - max(x1i, x1j))
-            inter_y = max(0.0, min(y2i, y2j) - max(y1i, y1j))
-            inter_area = inter_x * inter_y
-            min_area = min(area_i, area_j)
-            if min_area > 0 and inter_area / min_area >= thresh:
-                pi, pj = find(i), find(j)
-                if pi != pj:
-                    parent[pi] = pj
+        def find(i):
+            while parent[i] != i:
+                parent[i] = parent[parent[i]]
+                i = parent[i]
+            return i
 
-    groups = defaultdict(list)
-    for i in range(n):
-        groups[find(i)].append(i)
+        for i in range(n):
+            _, x1i, y1i, x2i, y2i = raw[i]
+            area_i = (x2i - x1i) * (y2i - y1i)
+            for j in range(i + 1, n):
+                _, x1j, y1j, x2j, y2j = raw[j]
+                area_j = (x2j - x1j) * (y2j - y1j)
+                inter_x = max(0.0, min(x2i, x2j) - max(x1i, x1j))
+                inter_y = max(0.0, min(y2i, y2j) - max(y1i, y1j))
+                inter_area = inter_x * inter_y
+                min_area = min(area_i, area_j)
+                if min_area > 0 and inter_area / min_area >= thresh:
+                    pi, pj = find(i), find(j)
+                    if pi != pj:
+                        parent[pi] = pj
 
-    if all(len(m) == 1 for m in groups.values()):
+        groups = defaultdict(list)
+        for i in range(n):
+            groups[find(i)].append(i)
+
+        result = []
+        for members in groups.values():
+            if len(members) == 1:
+                result.append(raw[members[0]])
+            else:
+                best_cls, best_area = raw[members[0]][0], 0
+                x1s, y1s, x2s, y2s = [], [], [], []
+                for idx in members:
+                    cls, x1, y1, x2, y2 = raw[idx]
+                    area = (x2 - x1) * (y2 - y1)
+                    if area > best_area:
+                        best_area, best_cls = area, cls
+                    x1s.append(x1); y1s.append(y1)
+                    x2s.append(x2); y2s.append(y2)
+                result.append((best_cls, min(x1s), min(y1s), max(x2s), max(y2s)))
+        return result, n - len(result)
+
+    raw = _parse(txt_path)
+    original_count = len(raw)
+    while True:
+        raw, reduced = _one_pass(raw)
+        if reduced == 0:
+            break
+
+    final_count = len(raw)
+    if final_count == original_count:
         return 0  # 변경 없음
 
     lines = []
-    for members in groups.values():
-        if len(members) == 1:
-            cls, x1, y1, x2, y2 = raw[members[0]]
-        else:
-            best_cls, best_area = raw[members[0]][0], 0
-            x1s, y1s, x2s, y2s = [], [], [], []
-            for idx in members:
-                cls, x1, y1, x2, y2 = raw[idx]
-                area = (x2 - x1) * (y2 - y1)
-                if area > best_area:
-                    best_area, best_cls = area, cls
-                x1s.append(x1); y1s.append(y1)
-                x2s.append(x2); y2s.append(y2)
-            cls = best_cls
-            x1, y1, x2, y2 = min(x1s), min(y1s), max(x2s), max(y2s)
+    for cls, x1, y1, x2, y2 in raw:
         cx = (x1 + x2) / 2; cy = (y1 + y2) / 2
         w  = x2 - x1;       h  = y2 - y1
         lines.append(f"{cls} {cx:.6f} {cy:.6f} {w:.6f} {h:.6f}")
-
     txt_path.write_text("\n".join(lines) + "\n", encoding="utf-8")
-    return n - len(lines)
+    return original_count - final_count
 
 
 def _remove_border_small_boxes(boxes, img_w, img_h):
@@ -748,6 +777,73 @@ class _BoxIndexBar(QWidget):
     def leaveEvent(self, _):
         self._hover_i = -1
         self.update()
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+# sources 폴더 선택 다이얼로그
+# ══════════════════════════════════════════════════════════════════════════════
+class SourceFolderDialog(QDialog):
+    """SOURCES_DIR 안의 하위 폴더를 목록으로 보여주고 선택하게 한다."""
+
+    def __init__(self, parent=None):
+        super().__init__(parent)
+        self.setWindowTitle("검수할 폴더 선택")
+        self.setMinimumSize(480, 400)
+        self.selected_path: Path | None = None
+
+        layout = QVBoxLayout(self)
+        layout.setSpacing(8)
+
+        # 안내 레이블
+        lbl = QLabel(f"📁  {SOURCES_DIR}")
+        lbl.setStyleSheet("font-size:11px; color:#aaaaaa; padding:4px 0;")
+        layout.addWidget(lbl)
+
+        # 폴더 목록
+        self.list_widget = QListWidget()
+        self.list_widget.setStyleSheet(
+            "QListWidget{background:#1e1e1e;border:1px solid #3a3a3a;font-size:13px;}"
+            "QListWidget::item{padding:5px 8px;border-bottom:1px solid #2a2a2a;}"
+            "QListWidget::item:selected{background:#094771;color:#fff;}"
+            "QListWidget::item:hover{background:#2a2d2e;}"
+        )
+        self._populate()
+        self.list_widget.itemDoubleClicked.connect(self._accept)
+        layout.addWidget(self.list_widget)
+
+        # 버튼
+        btn_box = QDialogButtonBox(QDialogButtonBox.Ok | QDialogButtonBox.Cancel)
+        btn_box.accepted.connect(self._accept)
+        btn_box.rejected.connect(self.reject)
+        btn_other = QPushButton("다른 폴더…")
+        btn_other.clicked.connect(self._browse_other)
+        btn_box.addButton(btn_other, QDialogButtonBox.ActionRole)
+        layout.addWidget(btn_box)
+
+    def _populate(self):
+        self.list_widget.clear()
+        if SOURCES_DIR.exists():
+            folders = sorted(
+                [p for p in SOURCES_DIR.iterdir() if p.is_dir()],
+                key=lambda p: p.name
+            )
+            for f in folders:
+                self.list_widget.addItem(f.name)
+        else:
+            self.list_widget.addItem("⚠ sources 폴더를 찾을 수 없습니다")
+
+    def _accept(self):
+        item = self.list_widget.currentItem()
+        if item is None:
+            return
+        self.selected_path = SOURCES_DIR / item.text()
+        self.accept()
+
+    def _browse_other(self):
+        folder = QFileDialog.getExistingDirectory(self, "폴더 직접 선택")
+        if folder:
+            self.selected_path = Path(folder).resolve()
+            self.accept()
 
 
 # ══════════════════════════════════════════════════════════════════════════════
@@ -2508,9 +2604,12 @@ class ReviewApp(QMainWindow):
     # 폴더 선택 / 검수
     # ══════════════════════════════════════════════════════════════════════════
     def _select_folder(self):
-        folder = QFileDialog.getExistingDirectory(self, "이미지 + txt 폴더 선택")
-        if not folder:
+        dlg = SourceFolderDialog(self)
+        if dlg.exec_() != QDialog.Accepted or dlg.selected_path is None:
             return
+        self._load_folder(dlg.selected_path)
+
+    def _load_folder(self, folder: Path):
         self.selected_folder = Path(folder).resolve()
         self.folder_label.setText(str(self.selected_folder))
         self.folder_label.setStyleSheet(
@@ -2704,6 +2803,60 @@ class ReviewApp(QMainWindow):
             if self.file_list.count() > 0:
                 first_idx = self.file_list.item(0).data(Qt.UserRole)
                 self._load_image_at(first_idx)
+
+        # 신규 검수일 때만 자동 전처리 (캐시 로드 시에는 건너뜀)
+        if not from_cache:
+            self._auto_preprocess()
+
+    def _auto_preprocess(self):
+        """신규 검수 직후 자동 전처리:
+        1) 재귀적 겹침 박스 통합 (변화 없을 때까지)
+        2) 테두리 소형 박스 제거 (1회)
+        """
+        if not self.results:
+            return
+
+        merge_total = 0
+        border_total = 0
+
+        for r in self.results:
+            txt_path = r.get("txt_path")
+            if not txt_path:
+                continue
+            # 1) 재귀적 통합 (함수 내부에서 수렴할 때까지 반복)
+            removed_merge = _merge_width_overlapping_txt(txt_path, thresh=0.5)
+            if removed_merge:
+                merge_total += removed_merge
+                r["box_count"] = max(0, r.get("box_count", 0) - removed_merge)
+                r.pop("has_duplicate", None)
+                r.pop("cls_counts", None)
+
+            # 2) 테두리 소형 박스 제거 (1회)
+            removed_border = _remove_border_small_boxes_txt(txt_path)
+            if removed_border:
+                border_total += removed_border
+                r["box_count"] = max(0, r.get("box_count", 0) - removed_border)
+                r.pop("has_duplicate", None)
+                r.pop("cls_counts", None)
+
+        # 박스 수 오름차순 정렬로 전환 후 목록 갱신
+        self._sort_key = "box_asc"
+        for i in range(self.sort_combo.count()):
+            if self.sort_combo.itemData(i) == "box_asc":
+                self.sort_combo.blockSignals(True)
+                self.sort_combo.setCurrentIndex(i)
+                self.sort_combo.blockSignals(False)
+                break
+        self._sort_results()
+        self._populate_list()
+        # 정렬 후 첫 번째 이미지 로드
+        if self.results and self.file_list.count() > 0:
+            first_idx = self.file_list.item(0).data(Qt.UserRole)
+            self._load_image_at(first_idx)
+
+        save_cache(self.selected_folder, self.results)
+        self.status_label.setText(
+            f"자동 전처리 완료 — 통합 -{merge_total}개, 테두리 제거 -{border_total}개")
 
     def _on_partial_finished(self, new_results: list):
         self.progress_bar.setVisible(False)
@@ -3074,6 +3227,15 @@ class ReviewApp(QMainWindow):
 if __name__ == "__main__":
     app = QApplication(sys.argv)
     app.setStyle("Fusion")
+    app.setStyleSheet(DARK)
+
+    # ── 시작 시 sources 폴더 선택 팝업 ──────────────────────────────────────
+    dlg = SourceFolderDialog()
+    if dlg.exec_() != QDialog.Accepted or dlg.selected_path is None:
+        sys.exit(0)
+
     win = ReviewApp()
     win.show()
+    # 선택된 폴더를 자동으로 로드
+    win._load_folder(dlg.selected_path)
     sys.exit(app.exec_())
