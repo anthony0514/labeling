@@ -2609,8 +2609,21 @@ class ReviewApp(QMainWindow):
             return
         self._load_folder(dlg.selected_path)
 
+    @staticmethod
+    def _create_missing_txt_pairs(folder: Path):
+        img_exts = {".jpg", ".jpeg", ".png", ".bmp"}
+        created = 0
+        for p in folder.iterdir():
+            if p.suffix.lower() in img_exts:
+                txt = p.with_suffix(".txt")
+                if not txt.exists():
+                    txt.touch()
+                    created += 1
+        return created
+
     def _load_folder(self, folder: Path):
         self.selected_folder = Path(folder).resolve()
+        self._create_missing_txt_pairs(self.selected_folder)
         self.folder_label.setText(str(self.selected_folder))
         self.folder_label.setStyleSheet(
             "padding:3px 8px; border:1px solid #3a3a3a; border-radius:4px;"
