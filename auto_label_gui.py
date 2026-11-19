@@ -1067,6 +1067,7 @@ class AutoLabelWindow(QMainWindow):
             output=output,
             conf=self.conf_spin.value(),
             iou=self.iou_spin.value(),
+            imgsz=1280,
             append=append,
             class_remap=class_remap,
         )
