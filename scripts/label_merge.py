@@ -286,28 +286,31 @@ def merge_3way(base: List[Box], a: List[Box], b: List[Box], thr: float, prefer: 
     return out, conflicts
 
 
-def cmd_merge(args) -> int:
-    ours, theirs = Path(args.ours).resolve(), Path(args.theirs).resolve()
-    base = Path(args.base).resolve() if args.base else None
-    out_dir = Path(args.out).resolve()
+def run_merge(ours, theirs, out, base=None, iou=0.5, strategy="union", conflict="ours",
+              names=None, force=False, log=print, verbose=False) -> dict:
+    """병합 실행. CLI(cmd_merge)와 GUI(label_merge_gui.py)가 함께 쓴다.
+    잘못된 입력이면 ValueError."""
+    ours, theirs = Path(ours).resolve(), Path(theirs).resolve()
+    base = Path(base).resolve() if base else None
+    out_dir = Path(out).resolve()
     for p in (ours, theirs, base):
         if p is not None and (out_dir == p or p in out_dir.parents):
-            sys.exit(f"--out 은 입력 폴더({p})와 달라야 합니다.")
-    if out_dir.exists() and any(out_dir.iterdir()) and not args.force:
-        sys.exit(f"--out 폴더가 비어 있지 않습니다: {out_dir}  (덮어쓰려면 --force)")
-    names = load_names(args.names)
+            raise ValueError(f"결과 폴더는 입력 폴더({p})와 달라야 합니다.")
+    if out_dir.exists() and any(out_dir.iterdir()) and not force:
+        raise ValueError(f"결과 폴더가 비어 있지 않습니다: {out_dir}  (덮어쓰려면 --force)")
+    out_dir.mkdir(parents=True, exist_ok=True)
 
     A, B, O = scan(ours), scan(theirs), scan(base)
     keys = sorted(set(A) | set(B))
     report, conflict_rows = [], []
-    tot = dict(files=0, written=0, conflict_files=0, conflicts=0, boxes=0)
+    tot = dict(files=0, conflict_files=0, conflicts=0, boxes=0)
 
     for k in keys:
         a, b = read_boxes(A.get(k)), read_boxes(B.get(k))
         if base is not None:
-            merged, confs = merge_3way(read_boxes(O.get(k)), a, b, args.iou, args.conflict)
+            merged, confs = merge_3way(read_boxes(O.get(k)), a, b, iou, conflict)
         else:
-            merged, confs, _ = merge_2way(a, b, args.iou, args.strategy, args.conflict)
+            merged, confs, _ = merge_2way(a, b, iou, strategy, conflict)
 
         # 원래 파일명 표기 유지 (ours 우선)
         src = A.get(k) or B.get(k)
@@ -317,7 +320,6 @@ def cmd_merge(args) -> int:
         dst.write_text("".join(x.raw + "\n" for x in merged), encoding="utf-8")
 
         tot["files"] += 1
-        tot["written"] += 1
         tot["boxes"] += len(merged)
         status = "C" if confs else ("M" if [x.raw for x in merged] != [x.raw for x in a] else "=")
         if confs:
@@ -329,15 +331,15 @@ def cmd_merge(args) -> int:
                     k, kind,
                     cname(ya.cls, names) if ya else "(삭제)",
                     cname(yb.cls, names) if yb else "(삭제)",
-                    args.conflict,
+                    conflict,
                     (ya or yb).raw,
                 ])
-            if args.verbose:
-                print(f"C {k}")
+            if verbose:
+                log(f"C {k}")
                 for c in confs:
                     ya, yb = c[1], c[2]
-                    print(f"    ! {c[0]:<28} ours={cname(ya.cls, names) if ya else '(삭제)'}  "
-                          f"theirs={cname(yb.cls, names) if yb else '(삭제)'}  → {args.conflict}")
+                    log(f"    ! {c[0]:<28} ours={cname(ya.cls, names) if ya else '(삭제)'}  "
+                        f"theirs={cname(yb.cls, names) if yb else '(삭제)'}  → {conflict}")
         report.append([status, k, len(a), len(b), len(merged), len(confs)])
 
     with open(out_dir / "_merge_report.csv", "w", newline="", encoding="utf-8-sig") as f:
@@ -350,15 +352,26 @@ def cmd_merge(args) -> int:
             w.writerow(["file", "kind", "ours", "theirs", "picked", "box"])
             w.writerows(conflict_rows)
 
-    mode = f"3-way (base={base})" if base else f"2-way (strategy={args.strategy})"
-    changed = sum(1 for r in report if r[0] != "=")
-    print("─" * 80)
-    print(f"병합 방식: {mode}, IoU {args.iou}, 충돌 시 {args.conflict} 우선")
-    print(f"파일 {tot['files']}개 저장 → {out_dir}")
-    print(f"ours 대비 바뀐 파일 {changed}개, 충돌 파일 {tot['conflict_files']}개 (충돌 {tot['conflicts']}건)")
-    print(f"병합 후 박스 {tot['boxes']}개")
+    tot["changed"] = sum(1 for r in report if r[0] != "=")
+    tot["mode"] = f"3-way (base={base})" if base else f"2-way (strategy={strategy})"
+    tot["out"] = str(out_dir)
+    log("─" * 80)
+    log(f"병합 방식: {tot['mode']}, IoU {iou}, 충돌 시 {conflict} 우선")
+    log(f"파일 {tot['files']}개 저장 → {out_dir}")
+    log(f"ours 대비 바뀐 파일 {tot['changed']}개, 충돌 파일 {tot['conflict_files']}개 (충돌 {tot['conflicts']}건)")
+    log(f"병합 후 박스 {tot['boxes']}개")
     if conflict_rows:
-        print(f"충돌 목록: {out_dir / '_conflicts.csv'}")
+        log(f"충돌 목록: {out_dir / '_conflicts.csv'}")
+    return tot
+
+
+def cmd_merge(args) -> int:
+    try:
+        run_merge(args.ours, args.theirs, args.out, base=args.base, iou=args.iou,
+                  strategy=args.strategy, conflict=args.conflict, names=load_names(args.names),
+                  force=args.force, verbose=args.verbose)
+    except ValueError as e:
+        sys.exit(str(e))
     return 0
 
 
