@@ -1,0 +1,27 @@
+nc: 24
+ 
+names:
+  0: "Cutout Fuse Discoloration"  # a COS 퓨즈 변색
+  1: "Missing Cutout Fuse"  # b COS 퓨즈 누락
+  2: "Transformer Insulator/Fuse Discoloration"  # c 변압기 애자/퓨즈 변색
+  3: "Transformer Discoloration"  # d 변압기 변색
+  4: "Transformer Oil Leak"  # e 변압기 오일 누유
+  5: "Washer Intrusion"  # f 와셔 함몰
+  6: "Loose Chicken-wing Bracket"  # g 치킨윙 브라켓 고정 불량
+  7: "Steel Bracket"  # h 철제 브라켓
+  8: "Pole Damage"  # i 전주 손상
+  9: "Pole(bottom) Damage"  # j 전주 손상(중하단)
+  10: "Vegetation Encroachment"  # k 수목 접근·침범
+  11: "Insulator Discoloration"  # l 애자 변색
+  12: "Insulator Dirt"  # m 애자 오염
+  13: "Insulator Crack"  # n 애자 균열
+  14: "Shackle Insulator Crack / Damage"  # o 샤클 애자 균열·손상
+  15: "Conductor Damage"  # p 전선 손상
+  16: "Missing Pre-form"  # q 프리폼 이탈
+  17: "Wire Cover Damage"  # r 전선 커버 손상
+  18: "Cut / Abnormal Wire"  # s 전선 절단·이상
+  19: "Loose Bolt / Nut"  # t 볼트·너트 풀림
+  20: "Missing Bolt / Nut"  # u 볼트·너트 누락
+  21: "Guy Guard Damage"  # v 지선 보호대 손상
+  22: "Cut / Missing Ground Wire"  # w 접지선 절단·누락
+  23: "Hole in Pole Surface"  # x 전주 표면 손상(구멍)

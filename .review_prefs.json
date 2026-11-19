@@ -1,11 +1,12 @@
 {
-  "config_name": "config_defect",
+  "config_name": "config_indonesia",
   "auto_confirm": false,
   "dup_iou": 85,
   "dup_area": 75,
-  "sort_key": "box_desc",
+  "sort_key": "box_asc",
   "window_w": 1920,
   "window_h": 1018,
-  "show_minimap": true,
-  "show_class_preview": false
+  "show_minimap": false,
+  "show_class_preview": false,
+  "export_by_type": false
 }

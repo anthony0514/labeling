@@ -26,7 +26,9 @@ from PyQt5.QtWidgets import (
 from PyQt5.QtGui import (
     QPixmap, QImage, QColor, QPainter, QPen, QBrush, QCursor, QFont
 )
-from PyQt5.QtCore import Qt, QThread, pyqtSignal, QPoint, QPointF, QRectF, QTimer
+from PyQt5.QtCore import (
+    Qt, QThread, pyqtSignal, QPoint, QPointF, QRectF, QTimer, QBuffer
+)
 
 # ── 경로 ─────────────────────────────────────────────────────────────────────
 SCRIPT_DIR   = Path(__file__).resolve().parent
@@ -35,7 +37,7 @@ DATASET_YAML = PROJECT_ROOT / "dataset.yaml"
 CONFIG_DIR   = SCRIPT_DIR / "config"
 REFS_DIR     = SCRIPT_DIR / "refs"
 PREFS_PATH   = SCRIPT_DIR / ".review_prefs.json"
-SOURCES_DIR  = SCRIPT_DIR / "sources"
+SOURCES_DIR  = SCRIPT_DIR.parent / "sources"   # 프로젝트 폴더 바깥(상위)의 sources
 
 # ── 기본 사용자 설정 ──────────────────────────────────────────────────────────
 _DEFAULT_PREFS: dict = {
@@ -48,6 +50,7 @@ _DEFAULT_PREFS: dict = {
     "window_h": 900,
     "show_minimap": True,
     "show_class_preview": True,
+    "export_by_type": False,   # True → defect type 별 하위 폴더로 분류
 }
 
 # ── 다크 테마 ─────────────────────────────────────────────────────────────────
@@ -116,6 +119,40 @@ QToolTip { background: #333; color: #dcdcdc; border: 1px solid #555; }
 # ══════════════════════════════════════════════════════════════════════════════
 # 유틸 함수 (원본 유지)
 # ══════════════════════════════════════════════════════════════════════════════
+IMG_EXTS = {".jpg", ".jpeg", ".png", ".bmp"}
+
+
+def collect_images(folder: Path) -> list:
+    """폴더와 모든 하위 폴더의 이미지를 경로순으로 모은다."""
+    return sorted(p for p in folder.rglob("*")
+                  if p.suffix.lower() in IMG_EXTS and p.is_file())
+
+
+def rel_name(img_path: Path, root: Path) -> str:
+    """선택 폴더 기준 상대 경로. 바로 밑이면 파일명과 같다."""
+    try:
+        return img_path.relative_to(root).as_posix()
+    except ValueError:
+        return img_path.name
+
+
+def unique_stems(imgs: list, root: Path) -> dict:
+    """{경로: 색인용 stem}. 하위 폴더에 같은 이름이 있을 때만 폴더명을 붙인다.
+
+    이름이 겹치지 않으면 원래 stem 그대로라 기존 색인 파일명이 바뀌지 않는다.
+    """
+    from collections import Counter
+    dup = Counter(p.stem for p in imgs)
+    out = {}
+    for p in imgs:
+        if dup[p.stem] == 1:
+            out[p] = p.stem
+        else:
+            rel = Path(rel_name(p, root)).with_suffix("")
+            out[p] = "_".join(rel.parts)
+    return out
+
+
 def load_class_names_list(config_dir: Path = None):
     config_dir = config_dir or CONFIG_DIR
     names_path = config_dir / "obj.names"
@@ -185,6 +222,45 @@ def get_color_for_class(cls: int) -> QColor:
         QColor(128, 128, 0),
     ]
     return colors[cls % len(colors)]
+
+
+def safe_dir_name(name: str) -> str:
+    """클래스명을 폴더명으로 쓸 수 있게 금지 문자 치환."""
+    out = "".join("_" if c in '/\\:*?"<>|' else c for c in name).strip(" .")
+    return out or "unnamed"
+
+
+INDEX_SUFFIX = "U"          # 색인 파일명 고정 구분자  (예: a01U_원본명)
+INDEX_LABEL  = "상단"       # 위 구분자의 표기 (표 머리글용)
+
+
+def type_code(cls: int) -> str:
+    """결함 번호 → 알파벳 코드. 0→a, 1→b … 25→z, 26→aa.
+
+    classes.yaml 주석의 코드 표기(0:a ~ 23:x)와 같은 0-based 기준.
+    """
+    if cls < 0:
+        return ""
+    n, out = cls + 1, ""
+    while n > 0:
+        n, r = divmod(n - 1, 26)
+        out = chr(ord("a") + r) + out
+    return out
+
+
+def index_stem(cls: int, count: int, stem: str) -> str:
+    """색인 파일명(확장자 제외). <결함코드><결함갯수 2자리><구분>_<원본명>.
+
+    count 는 그 이미지 안의 해당 타입 박스 수.
+    예: cls=1, count=3, stem='img' → 'a03U_img'
+    """
+    return f"{type_code(cls)}{count:02d}{INDEX_SUFFIX}_{stem}"
+
+
+def _text_color_on(bg: QColor) -> QColor:
+    """배경색 밝기에 따라 검정/흰색 글자색 선택."""
+    lum = (0.299 * bg.red() + 0.587 * bg.green() + 0.114 * bg.blue()) / 255
+    return QColor(0, 0, 0) if lum > 0.55 else QColor(255, 255, 255)
 
 
 def imread_unicode(path: str):
@@ -578,16 +654,368 @@ class ZipWorker(QThread):
 
     def run(self):
         try:
-            txt_files = sorted(self.src_folder.glob("*.txt"))
+            txt_files = sorted(self.src_folder.rglob("*.txt"))
             if not txt_files:
                 self.error.emit("폴더 내에 .txt 파일이 없습니다.")
                 return
             total = len(txt_files)
             with zipfile.ZipFile(self.zip_path, "w", zipfile.ZIP_DEFLATED) as zf:
                 for i, f in enumerate(txt_files, 1):
-                    zf.write(f, f.name)
+                    # 하위 폴더 구조를 유지해야 같은 이름끼리 덮어쓰지 않는다
+                    zf.write(f, str(f.relative_to(self.src_folder)))
                     self.progress.emit(i, total)
             self.finished.emit(str(self.zip_path), total)
+        except Exception:
+            import traceback
+            self.error.emit(traceback.format_exc())
+
+
+def render_boxed_image(img_path: Path, class_names: list):
+    """이미지에 박스를 그려 넣은 QImage 반환.
+
+    반환: (QImage, boxes) · 박스 없으면 (None, []) · 로드 실패면 (None, None)
+    """
+    img = imread_unicode(str(img_path))
+    if img is None:
+        return None, None
+    h, w = img.shape[:2]
+
+    boxes = load_boxes_from_txt(img_path.with_suffix(".txt"), w, h)
+    if not boxes:
+        return None, []
+
+    rgb  = cv2.cvtColor(img, cv2.COLOR_BGR2RGB)
+    qimg = QImage(rgb.data, w, h, w * 3, QImage.Format_RGB888).copy()
+
+    lw = max(2, round(min(w, h) / 500))
+    fs = max(11, round(min(w, h) / 55))
+    painter = QPainter(qimg)
+    font = QFont(); font.setPixelSize(fs); font.setBold(True)
+    painter.setFont(font)
+    fm  = painter.fontMetrics()
+    pad = fs * 0.35
+    for cls, x1, y1, x2, y2 in boxes:
+        color = get_color_for_class(cls)
+        painter.setPen(QPen(color, lw))
+        painter.setBrush(Qt.NoBrush)
+        painter.drawRect(QRectF(x1, y1, x2 - x1, y2 - y1))
+
+        lbl = (f"{cls} {class_names[cls]}"
+               if cls < len(class_names) else str(cls))
+        tw = fm.boundingRect(lbl).width() + pad * 2
+        th = fm.height() + pad
+        ty = y1 - th
+        if ty < 0:                          # 위쪽 여백 없으면 박스 안쪽에
+            ty = y1
+        painter.setPen(Qt.NoPen)
+        painter.setBrush(QBrush(color))
+        painter.drawRect(QRectF(x1, ty, tw, th))
+        painter.setPen(QPen(_text_color_on(color)))
+        painter.drawText(QRectF(x1, ty, tw, th), Qt.AlignCenter, lbl)
+    painter.end()
+    return qimg, boxes
+
+
+def encode_qimage(qimg: QImage, fmt: str = "JPG", quality: int = 95):
+    """QImage → 인코딩된 bytes. 실패 시 None."""
+    buf = QBuffer()
+    buf.open(QBuffer.WriteOnly)
+    if not qimg.save(buf, fmt, quality):
+        return None
+    return bytes(buf.data())
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+# 박스 구운 이미지 추출 워커
+# ══════════════════════════════════════════════════════════════════════════════
+class ExportWorker(QThread):
+    """폴더 내 이미지 중 박스가 있는 것만 박스를 그려 넣어 별도 폴더로 저장.
+
+    by_type=False → 출력 폴더 하나에 통으로 저장
+    by_type=True  → 출력 폴더 아래 defect type 별 하위 폴더로 분류
+                    (여러 타입이 있는 이미지는 해당 타입 폴더마다 복사)
+    """
+    progress = pyqtSignal(int, int)
+    finished = pyqtSignal(str, int, int, int)  # (출력 폴더, 저장, 건너뜀, 실패)
+    error    = pyqtSignal(str)
+
+    IMG_EXTS = {".jpg", ".jpeg", ".png", ".bmp"}
+
+    def __init__(self, src_folder: Path, out_folder: Path, class_names: list,
+                 by_type: bool = False):
+        super().__init__()
+        self.src_folder  = src_folder
+        self.out_folder  = out_folder
+        self.class_names = class_names
+        self.by_type     = by_type
+        self._stems      = {}           # {이미지 경로: 색인용 stem}
+
+    def _targets(self, img_path: Path, boxes, ext: str) -> list:
+        """저장할 (폴더, 색인 파일명) 목록. 이미지에 있는 타입마다 1개씩."""
+        counts = {}
+        for b in boxes:
+            counts[b[0]] = counts.get(b[0], 0) + 1
+
+        stem = self._stems.get(img_path, img_path.stem)
+        targets = []
+        for cls in sorted(counts):
+            fname = index_stem(cls, counts[cls], stem) + ext
+            if self.by_type:
+                name = (self.class_names[cls]
+                        if cls < len(self.class_names) else str(cls))
+                d = self.out_folder / f"{cls:02d}_{safe_dir_name(name)}"
+            else:
+                d = self.out_folder
+            targets.append((d, fname))
+        return targets
+
+    def run(self):
+        try:
+            imgs = collect_images(self.src_folder)
+            if not imgs:
+                self.error.emit("폴더 내에 이미지 파일이 없습니다.")
+                return
+            self._stems = unique_stems(imgs, self.src_folder)
+            total = len(imgs)
+            saved = skipped = failed = 0
+            for i, img_path in enumerate(imgs, 1):
+                st = self._export_one(img_path)
+                if st == "saved":
+                    saved += 1
+                elif st == "skipped":
+                    skipped += 1
+                else:
+                    failed += 1
+                self.progress.emit(i, total)
+            self.finished.emit(str(self.out_folder), saved, skipped, failed)
+        except Exception:
+            import traceback
+            self.error.emit(traceback.format_exc())
+
+    def _export_one(self, img_path: Path) -> str:
+        """반환: "saved" | "skipped"(박스 없음) | "failed"."""
+        qimg, boxes = render_boxed_image(img_path, self.class_names)
+        if boxes is None:
+            return "failed"
+        if not boxes:
+            return "skipped"
+
+        is_png = img_path.suffix.lower() == ".png"
+        ext    = ".png" if is_png else ".jpg"
+        data   = encode_qimage(qimg, "PNG" if is_png else "JPG")
+        if data is None:
+            return "failed"
+
+        for d, fname in self._targets(img_path, boxes, ext):
+            d.mkdir(parents=True, exist_ok=True)
+            (d / fname).write_bytes(data)
+        return "saved"
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+# defect type 별 결함 표 (xlsx) 워커
+# ══════════════════════════════════════════════════════════════════════════════
+def crop_box_image(img, box, pad_ratio: float = 0.3, min_pad: int = 10):
+    """박스 1개를 여백 포함해 크롭하고 테두리를 그린 QImage. 실패 시 None."""
+    cls, x1, y1, x2, y2 = box
+    h, w = img.shape[:2]
+    padx = max(min_pad, (x2 - x1) * pad_ratio)
+    pady = max(min_pad, (y2 - y1) * pad_ratio)
+    cx1 = max(0, int(x1 - padx)); cy1 = max(0, int(y1 - pady))
+    cx2 = min(w, int(x2 + padx)); cy2 = min(h, int(y2 + pady))
+    if cx2 - cx1 < 2 or cy2 - cy1 < 2:
+        return None
+
+    rgb = cv2.cvtColor(img[cy1:cy2, cx1:cx2], cv2.COLOR_BGR2RGB)
+    ch, cw = rgb.shape[:2]
+    qimg = QImage(rgb.data, cw, ch, cw * 3, QImage.Format_RGB888).copy()
+
+    painter = QPainter(qimg)
+    painter.setPen(QPen(get_color_for_class(cls), max(2, round(min(cw, ch) / 110))))
+    painter.setBrush(Qt.NoBrush)
+    painter.drawRect(QRectF(x1 - cx1, y1 - cy1, x2 - x1, y2 - y1))
+    painter.end()
+    return qimg
+
+
+class TypeSheetWorker(QThread):
+    """이미지 1장 = 3행 블록(이미지 / 원본 파일명 / 색인 파일명)인 결함 표(xlsx).
+
+    결함 코드 | 결함 유형 | Defect Type | 결함 갯수 | 위험도(0~5) | 구분 | 상단(U)
+    결함 갯수 = 그 이미지 안에 있는 해당 타입 박스 수.
+    결함 유형(한글)·위험도는 수동 입력용으로 비워 둔다.
+    이미지가 없는 불량 번호는 생략하고, 파일이 다르면 블록을 합치지 않는다.
+    """
+    progress = pyqtSignal(int, int)
+    finished = pyqtSignal(str, int, int)   # (파일 경로, 타입 수, 이미지 건수)
+    error    = pyqtSignal(str)
+
+    IMG_EXTS = {".jpg", ".jpeg", ".png", ".bmp"}
+    THUMB_W, THUMB_H = 170, 118
+    HEADERS = ["결함\n코드", "결함 유형", "Defect Type", "결함\n갯수",
+               "위험도\n(0~5)", "구분", f"{INDEX_LABEL} ({INDEX_SUFFIX})"]
+    COL_WIDTHS = (7, 20, 32, 7, 9, 12, 34)
+    ROW_LABELS = ["이미지", "원본 파일명", "색인 파일명"]
+    MERGE_COLS = 5                          # A~E 는 블록 세로 병합
+    DATA_COL    = 7                         # G열
+    DATA_COL_W  = 34
+    IMG_ROW_H   = 92
+
+    def __init__(self, src_folder: Path, out_path: Path, class_names: list):
+        super().__init__()
+        self.src_folder  = src_folder
+        self.out_path    = out_path
+        self.class_names = class_names
+
+    # ── 수집 ────────────────────────────────────────────────────────────────
+    def _collect(self, imgs: list) -> dict:
+        """{클래스ID: [{orig, index, thumb, count}, ...]}  (이미지 1장 = 1건)"""
+        per_class = {}
+        stems = unique_stems(imgs, self.src_folder)
+        total = len(imgs)
+        for i, img_path in enumerate(imgs, 1):
+            self.progress.emit(i, total)
+            img = imread_unicode(str(img_path))
+            if img is None:
+                continue
+            h, w = img.shape[:2]
+            boxes = load_boxes_from_txt(img_path.with_suffix(".txt"), w, h)
+            if not boxes:
+                continue
+
+            by_cls = {}
+            for b in boxes:
+                by_cls.setdefault(b[0], []).append(b)
+            for cls, bs in by_cls.items():
+                # 크롭은 그 타입 박스 중 가장 큰 것을 대표로
+                best  = max(bs, key=lambda b: (b[3] - b[1]) * (b[4] - b[2]))
+                crop  = crop_box_image(img, best)
+                thumb = None
+                if crop is not None:
+                    thumb = encode_qimage(
+                        crop.scaled(self.THUMB_W, self.THUMB_H,
+                                    Qt.KeepAspectRatio, Qt.SmoothTransformation),
+                        "PNG")
+                ext = ".png" if img_path.suffix.lower() == ".png" else ".jpg"
+                per_class.setdefault(cls, []).append({
+                    "orig":  rel_name(img_path, self.src_folder),
+                    "index": index_stem(cls, len(bs),
+                                        stems.get(img_path, img_path.stem)) + ext,
+                    "thumb": thumb,
+                    "count": len(bs),        # 이 이미지 안의 해당 타입 박스 수
+                })
+        return per_class
+
+    def _text_height(self, text: str) -> float:
+        """파일명이 몇 줄로 접히는지 보고 행 높이 계산."""
+        lines = max(1, -(-len(text) // self.DATA_COL_W))     # 올림 나눗셈
+        return lines * 14 + 6
+
+    # ── 표 작성 ─────────────────────────────────────────────────────────────
+    def _write_xlsx(self, per_class: dict) -> tuple:
+        import io
+        from openpyxl import Workbook
+        from openpyxl.drawing.image import Image as XLImage
+        from openpyxl.styles import Alignment, Border, Font, PatternFill, Side
+        from openpyxl.utils import get_column_letter
+
+        wb = Workbook()
+        ws = wb.active
+        ws.title = "defect types"
+
+        thin   = Side(style="thin", color="BFBFBF")
+        border = Border(left=thin, right=thin, top=thin, bottom=thin)
+        gray   = PatternFill("solid", fgColor="F2F2F2")
+        center = Alignment(horizontal="center", vertical="center", wrap_text=True)
+        left   = Alignment(horizontal="left", vertical="center", wrap_text=True)
+        ncols  = len(self.HEADERS)
+
+        for i, width in enumerate(self.COL_WIDTHS, 1):
+            ws.column_dimensions[get_column_letter(i)].width = width
+
+        ws.row_dimensions[1].height = 32
+        for i, head in enumerate(self.HEADERS, 1):
+            c = ws.cell(row=1, column=i, value=head)
+            c.alignment = center
+            c.fill      = gray
+            c.font      = Font(bold=True, size=10)
+            c.border    = border
+
+        anchors = []                        # BytesIO 는 저장 시점까지 살려둬야 함
+        types = entries = 0
+        row = 2
+        for cls in sorted(per_class):
+            items = per_class[cls]
+            if not items:                   # 이미지 없는 불량 번호는 생략
+                continue
+            types += 1
+            name = (self.class_names[cls]
+                    if cls < len(self.class_names) else str(cls))
+
+            # 이미지 파일마다 독립 블록 (파일이 다르면 합치지 않는다)
+            for it in sorted(items, key=lambda d: d["orig"]):
+                entries += 1
+                ws.row_dimensions[row].height     = self.IMG_ROW_H
+                ws.row_dimensions[row + 1].height = self._text_height(it["orig"])
+                ws.row_dimensions[row + 2].height = self._text_height(it["index"])
+
+                # 틀 + 배경 (병합 전에 칠해야 테두리가 제대로 남는다)
+                for r in range(row, row + 3):
+                    for col in range(1, ncols + 1):
+                        c = ws.cell(row=r, column=col)
+                        c.border = border
+                        if col <= self.MERGE_COLS + 1:
+                            c.fill = gray
+
+                for col, val in ((1, type_code(cls)), (2, ""), (3, name),
+                                 (4, f"{it['count']:02d}"), (5, "")):
+                    ws.cell(row=row, column=col, value=val).alignment = center
+                for off, lab in enumerate(self.ROW_LABELS):
+                    c = ws.cell(row=row + off, column=self.MERGE_COLS + 1, value=lab)
+                    c.alignment = center
+                    c.font = Font(size=9)
+
+                ws.cell(row=row + 1, column=self.DATA_COL,
+                        value=it["orig"]).alignment = left
+                ws.cell(row=row + 2, column=self.DATA_COL,
+                        value=it["index"]).alignment = left
+                if it["thumb"]:
+                    bio = io.BytesIO(it["thumb"])
+                    xl  = XLImage(bio)
+                    scale = min(self.THUMB_W / xl.width, self.THUMB_H / xl.height, 1)
+                    xl.width  = int(xl.width * scale)
+                    xl.height = int(xl.height * scale)
+                    ws.add_image(xl, f"{get_column_letter(self.DATA_COL)}{row}")
+                    anchors.append(bio)
+
+                for col in range(1, self.MERGE_COLS + 1):
+                    ws.merge_cells(start_row=row, start_column=col,
+                                   end_row=row + 2, end_column=col)
+                row += 3
+
+        ws.freeze_panes = f"{get_column_letter(self.DATA_COL)}2"
+        wb.save(self.out_path)
+        return types, entries
+
+    def run(self):
+        try:
+            try:
+                import openpyxl                               # noqa: F401
+            except ImportError:
+                self.error.emit("openpyxl 이 필요합니다: pip install openpyxl")
+                return
+
+            imgs = collect_images(self.src_folder)
+            if not imgs:
+                self.error.emit("폴더 내에 이미지 파일이 없습니다.")
+                return
+
+            per_class = self._collect(imgs)
+            if not any(per_class.values()):     # 빈 파일을 만들지 않도록 먼저 확인
+                self.error.emit("박스가 있는 이미지가 없습니다.")
+                return
+            types, entries = self._write_xlsx(per_class)
+            self.finished.emit(str(self.out_path), types, entries)
         except Exception:
             import traceback
             self.error.emit(traceback.format_exc())
@@ -610,14 +1038,12 @@ class ReviewWorker(QThread):
 
     def run(self):
         try:
-            img_exts = {".jpg", ".jpeg", ".png", ".bmp"}
             pairs = []
-            for p in sorted(self.folder.iterdir()):
-                if p.suffix.lower() in img_exts:
-                    txt = p.with_suffix(".txt")
-                    if txt.exists():
-                        if self.file_filter is None or p.name in self.file_filter:
-                            pairs.append((p, txt))
+            for p in collect_images(self.folder):
+                txt = p.with_suffix(".txt")
+                if txt.exists():
+                    if self.file_filter is None or str(p) in self.file_filter:
+                        pairs.append((p, txt))
             if not pairs:
                 self.error.emit("처리할 이미지+txt 쌍이 없습니다.")
                 return
@@ -783,23 +1209,30 @@ class _BoxIndexBar(QWidget):
 # sources 폴더 선택 다이얼로그
 # ══════════════════════════════════════════════════════════════════════════════
 class SourceFolderDialog(QDialog):
-    """SOURCES_DIR 안의 하위 폴더를 목록으로 보여주고 선택하게 한다."""
+    """SOURCES_DIR 부터 하위 폴더를 파고들며 검수할 폴더를 고른다.
 
-    def __init__(self, parent=None):
+    더블클릭으로 들어가고, '이 폴더 선택' 으로 현재 폴더를 확정한다.
+    선택한 폴더의 모든 하위 이미지가 검수 대상이 된다.
+    """
+
+    UP_ITEM = "⬆  .."
+
+    def __init__(self, parent=None, start_dir: Path = None):
         super().__init__(parent)
         self.setWindowTitle("검수할 폴더 선택")
-        self.setMinimumSize(480, 400)
+        self.setMinimumSize(520, 440)
         self.selected_path: Path | None = None
+        self.cur_dir = Path(start_dir or SOURCES_DIR)
 
         layout = QVBoxLayout(self)
         layout.setSpacing(8)
 
-        # 안내 레이블
-        lbl = QLabel(f"📁  {SOURCES_DIR}")
-        lbl.setStyleSheet("font-size:11px; color:#aaaaaa; padding:4px 0;")
-        layout.addWidget(lbl)
+        self.path_label = QLabel()
+        self.path_label.setWordWrap(True)
+        self.path_label.setStyleSheet(
+            "font-size:11px; color:#aaaaaa; padding:4px 0;")
+        layout.addWidget(self.path_label)
 
-        # 폴더 목록
         self.list_widget = QListWidget()
         self.list_widget.setStyleSheet(
             "QListWidget{background:#1e1e1e;border:1px solid #3a3a3a;font-size:13px;}"
@@ -807,40 +1240,80 @@ class SourceFolderDialog(QDialog):
             "QListWidget::item:selected{background:#094771;color:#fff;}"
             "QListWidget::item:hover{background:#2a2d2e;}"
         )
-        self._populate()
-        self.list_widget.itemDoubleClicked.connect(self._accept)
+        self.list_widget.itemDoubleClicked.connect(self._on_double_click)
         layout.addWidget(self.list_widget)
 
-        # 버튼
+        hint = QLabel("더블클릭으로 하위 폴더 열기 · 확인을 누르면 "
+                      "그 폴더의 모든 하위 이미지가 대상입니다")
+        hint.setStyleSheet("font-size:10px; color:#777;")
+        layout.addWidget(hint)
+
         btn_box = QDialogButtonBox(QDialogButtonBox.Ok | QDialogButtonBox.Cancel)
         btn_box.accepted.connect(self._accept)
         btn_box.rejected.connect(self.reject)
+        btn_here = QPushButton("이 폴더 선택")
+        btn_here.clicked.connect(self._accept_current)
+        btn_box.addButton(btn_here, QDialogButtonBox.ActionRole)
         btn_other = QPushButton("다른 폴더…")
         btn_other.clicked.connect(self._browse_other)
         btn_box.addButton(btn_other, QDialogButtonBox.ActionRole)
         layout.addWidget(btn_box)
 
+        self._populate()
+
+    # ── 목록 ────────────────────────────────────────────────────────────────
     def _populate(self):
+        self.path_label.setText(f"📁  {self.cur_dir}")
         self.list_widget.clear()
-        if SOURCES_DIR.exists():
-            folders = sorted(
-                [p for p in SOURCES_DIR.iterdir() if p.is_dir()],
-                key=lambda p: p.name
-            )
-            for f in folders:
-                self.list_widget.addItem(f.name)
-        else:
-            self.list_widget.addItem("⚠ sources 폴더를 찾을 수 없습니다")
+        if not self.cur_dir.exists():
+            self.list_widget.addItem("⚠ 폴더를 찾을 수 없습니다")
+            return
+        if self.cur_dir != Path(SOURCES_DIR):
+            self.list_widget.addItem(self.UP_ITEM)
+        try:
+            subs = sorted((p for p in self.cur_dir.iterdir() if p.is_dir()),
+                          key=lambda p: p.name)
+        except OSError as e:
+            self.list_widget.addItem(f"⚠ 읽을 수 없습니다: {e}")
+            return
+        for f in subs:
+            self.list_widget.addItem(f"📁  {f.name}")
+        if not subs and self.cur_dir == Path(SOURCES_DIR):
+            self.list_widget.addItem("⚠ sources 폴더가 비어 있습니다")
+
+    def _item_path(self, item) -> Path | None:
+        """목록 항목 → 폴더 경로. '..' 이거나 안내 문구면 None."""
+        if item is None:
+            return None
+        text = item.text()
+        if text == self.UP_ITEM or text.startswith("⚠"):
+            return None
+        return self.cur_dir / text.replace("📁  ", "", 1)
+
+    # ── 이동 / 선택 ─────────────────────────────────────────────────────────
+    def _on_double_click(self, item):
+        if item.text() == self.UP_ITEM:
+            self.cur_dir = self.cur_dir.parent
+            self._populate()
+            return
+        path = self._item_path(item)
+        if path and path.is_dir():
+            self.cur_dir = path
+            self._populate()
 
     def _accept(self):
-        item = self.list_widget.currentItem()
-        if item is None:
-            return
-        self.selected_path = SOURCES_DIR / item.text()
+        """확인: 고른 폴더가 있으면 그 폴더, 없으면 현재 폴더."""
+        path = self._item_path(self.list_widget.currentItem())
+        self.selected_path = path if path else self.cur_dir
+        self.accept()
+
+    def _accept_current(self):
+        self.selected_path = self.cur_dir
         self.accept()
 
     def _browse_other(self):
-        folder = QFileDialog.getExistingDirectory(self, "폴더 직접 선택")
+        folder = QFileDialog.getExistingDirectory(
+            self, "폴더 직접 선택", str(self.cur_dir))
         if folder:
             self.selected_path = Path(folder).resolve()
             self.accept()
@@ -1062,9 +1535,36 @@ class ReviewApp(QMainWindow):
         self.btn_zip_txt = _btn("압축", "#5a3e8a", h=22, w=46)
         self.btn_zip_txt.setEnabled(False)
         self.btn_zip_txt.clicked.connect(self._zip_txt)
+        self.btn_export_img = _btn("🖼 추출", "#1f6f5c", h=22, w=64)
+        self.btn_export_img.setEnabled(False)
+        self.btn_export_img.setToolTip(
+            "박스가 있는 이미지만 박스를 그려서 <폴더명>_export 폴더로 저장")
+        self.btn_export_img.clicked.connect(self._export_boxed_images)
+        self.export_mode_combo = QComboBox()
+        self.export_mode_combo.setFixedHeight(22)
+        self.export_mode_combo.setFixedWidth(96)
+        self.export_mode_combo.addItem("한 폴더", userData=False)
+        self.export_mode_combo.addItem("타입별 폴더", userData=True)
+        self.export_mode_combo.setToolTip(
+            "한 폴더: 전부 <폴더명>_export 하나에 저장\n"
+            "타입별 폴더: defect type 별 하위 폴더로 분류 "
+            "(여러 타입이 있는 이미지는 각 폴더에 복사)")
+        self.export_mode_combo.currentIndexChanged.connect(
+            lambda _: self._save_prefs())
         r2.addWidget(zip_lbl)
         r2.addWidget(self.zip_name_edit)
         r2.addWidget(self.btn_zip_txt)
+        self.btn_type_sheet = _btn("📄 목록", "#3a6ea5", h=22, w=64)
+        self.btn_type_sheet.setEnabled(False)
+        self.btn_type_sheet.setToolTip(
+            "결함 표를 <폴더명>_types.xlsx 로 저장\n"
+            "(이미지 1장 = 3행 블록: 박스 크롭 / 원본 파일명 / 색인 파일명,\n"
+            " 결함 갯수는 그 이미지 안의 해당 타입 박스 수,\n"
+            " 이미지 없는 불량 번호는 생략)")
+        self.btn_type_sheet.clicked.connect(self._export_type_sheet)
+        r2.addWidget(self.btn_export_img)
+        r2.addWidget(self.export_mode_combo)
+        r2.addWidget(self.btn_type_sheet)
         r2.addWidget(_vsep())
 
         btn_reset_prefs = QPushButton("⟳ 설정 초기화")
@@ -1395,6 +1895,12 @@ class ReviewApp(QMainWindow):
                 self.sort_combo.blockSignals(False)
                 break
 
+        # 추출 폴더 분류 방식
+        self.export_mode_combo.blockSignals(True)
+        self.export_mode_combo.setCurrentIndex(
+            1 if prefs.get("export_by_type", False) else 0)
+        self.export_mode_combo.blockSignals(False)
+
         # 미니맵 / 클래스 미리보기 표시 여부
         self.show_minimap = bool(prefs.get("show_minimap", True))
         self.minimap_btn.setText("미니맵 ON (M)" if self.show_minimap else "미니맵 OFF (M)")
@@ -1419,6 +1925,7 @@ class ReviewApp(QMainWindow):
                 "window_h": self.height(),
                 "show_minimap": self.show_minimap,
                 "show_class_preview": self.show_class_preview,
+                "export_by_type": bool(self.export_mode_combo.currentData()),
             }
             PREFS_PATH.write_text(
                 json.dumps(prefs, ensure_ascii=False, indent=2),
@@ -1517,6 +2024,12 @@ class ReviewApp(QMainWindow):
     # ══════════════════════════════════════════════════════════════════════════
     # 파일 목록 패널
     # ══════════════════════════════════════════════════════════════════════════
+    def _display_name(self, img_path: Path) -> str:
+        """하위 폴더에 있으면 상대 경로로, 길면 앞을 자르고 파일명을 남긴다."""
+        name = (rel_name(img_path, self.selected_folder)
+                if self.selected_folder else img_path.name)
+        return name if len(name) <= 24 else "…" + name[-23:]
+
     def _populate_list(self):
         self.file_list.blockSignals(True)
         self.file_list.clear()
@@ -1556,9 +2069,7 @@ class ReviewApp(QMainWindow):
             icon    = "✅" if confirmed else ("⚠️" if is_issue else "  ")
             dup     = "🔁" if has_dup else "  "
             bc      = r.get("box_count", 0)
-            name    = r["img_path"].name
-            if len(name) > 20:
-                name = name[:17] + "..."
+            name = self._display_name(r["img_path"])
             text = f"{icon}{dup} {name}  [{bc}]"
 
             item = QListWidgetItem(text)
@@ -2611,14 +3122,13 @@ class ReviewApp(QMainWindow):
 
     @staticmethod
     def _create_missing_txt_pairs(folder: Path):
-        img_exts = {".jpg", ".jpeg", ".png", ".bmp"}
+        """하위 폴더까지 훑어서 txt 짝이 없는 이미지에만 빈 txt 를 만든다."""
         created = 0
-        for p in folder.iterdir():
-            if p.suffix.lower() in img_exts:
-                txt = p.with_suffix(".txt")
-                if not txt.exists():
-                    txt.touch()
-                    created += 1
+        for p in collect_images(folder):
+            txt = p.with_suffix(".txt")
+            if not txt.exists():
+                txt.touch()
+                created += 1
         return created
 
     def _load_folder(self, folder: Path):
@@ -2630,6 +3140,8 @@ class ReviewApp(QMainWindow):
             "background:#1e1e1e; color:#dcdcdc;")
         self.btn_review.setEnabled(True)
         self.btn_zip_txt.setEnabled(True)
+        self.btn_export_img.setEnabled(True)
+        self.btn_type_sheet.setEnabled(True)
         self.zip_name_edit.setText(self.selected_folder.name)
         self.results = []
         self.cur_idx = 0
@@ -2689,6 +3201,85 @@ class ReviewApp(QMainWindow):
         self.btn_zip_txt.setEnabled(True)
         self.status_label.setText(f"압축 오류: {msg.splitlines()[-1]}")
 
+    # ══════════════════════════════════════════════════════════════════════════
+    # 박스 구운 이미지 추출
+    # ══════════════════════════════════════════════════════════════════════════
+    def _export_boxed_images(self):
+        if not self.selected_folder:
+            return
+        out_folder = (self.selected_folder.parent /
+                      f"{self.selected_folder.name}_export")
+        self.btn_export_img.setEnabled(False)
+        self.progress_bar.setVisible(True)
+        self.progress_bar.setValue(0)
+        self.status_label.setText("박스 이미지 추출 중...")
+        by_type = bool(self.export_mode_combo.currentData())
+        self._export_worker = ExportWorker(
+            self.selected_folder, out_folder, list(self.class_names), by_type)
+        self._export_worker.progress.connect(lambda c, t: (
+            self.progress_bar.setMaximum(t),
+            self.progress_bar.setValue(c),
+            self.progress_bar.setFormat(f"{c}/{t}"),
+        ))
+        self._export_worker.finished.connect(self._export_on_finished)
+        self._export_worker.error.connect(self._export_on_error)
+        self._export_worker.start()
+
+    def _export_on_finished(self, out_folder: str, saved: int,
+                            skipped: int, failed: int):
+        self.progress_bar.setVisible(False)
+        self.btn_export_img.setEnabled(True)
+        skip_str = f"  박스 없음: {skipped}개" if skipped else ""
+        fail_str = f"  실패: {failed}개" if failed else ""
+        if saved:
+            self.status_label.setText(
+                f"추출 완료: {Path(out_folder).name}  ({saved}개)"
+                f"{skip_str}{fail_str}")
+            self.status_label.setToolTip(out_folder)
+        else:
+            self.status_label.setText(f"추출할 박스가 없습니다.{skip_str}{fail_str}")
+            self.status_label.setToolTip("")
+
+    def _export_on_error(self, msg: str):
+        self.progress_bar.setVisible(False)
+        self.btn_export_img.setEnabled(True)
+        self.status_label.setText(f"추출 오류: {msg.splitlines()[-1]}")
+
+    # ══════════════════════════════════════════════════════════════════════════
+    # 타입별 이미지 목록 (2열 스프레드시트)
+    # ══════════════════════════════════════════════════════════════════════════
+    def _export_type_sheet(self):
+        if not self.selected_folder:
+            return
+        out_path = (self.selected_folder.parent /
+                    f"{self.selected_folder.name}_types.xlsx")
+        self.btn_type_sheet.setEnabled(False)
+        self.progress_bar.setVisible(True)
+        self.progress_bar.setValue(0)
+        self.status_label.setText("결함 표 작성 중...")
+        self._sheet_worker = TypeSheetWorker(
+            self.selected_folder, out_path, list(self.class_names))
+        self._sheet_worker.progress.connect(lambda c, t: (
+            self.progress_bar.setMaximum(t),
+            self.progress_bar.setValue(c),
+            self.progress_bar.setFormat(f"{c}/{t}"),
+        ))
+        self._sheet_worker.finished.connect(self._sheet_on_finished)
+        self._sheet_worker.error.connect(self._sheet_on_error)
+        self._sheet_worker.start()
+
+    def _sheet_on_finished(self, out_path: str, types: int, entries: int):
+        self.progress_bar.setVisible(False)
+        self.btn_type_sheet.setEnabled(True)
+        self.status_label.setText(
+            f"표 저장: {Path(out_path).name}  (타입 {types}개 / 이미지 {entries}건)")
+        self.status_label.setToolTip(out_path)
+
+    def _sheet_on_error(self, msg: str):
+        self.progress_bar.setVisible(False)
+        self.btn_type_sheet.setEnabled(True)
+        self.status_label.setText(f"표 오류: {msg.splitlines()[-1]}")
+
     def _get_modified_files(self) -> set:
         if not self.selected_folder:
             return set()
@@ -2699,17 +3290,14 @@ class ReviewApp(QMainWindow):
             with open(cp, "rb") as f:
                 data = pickle.load(f)
             ts = data.get("ts", 0)
-            cached_names = {r["img_path"].name for r in (data.get("results") or [])}
+            cached_keys = {str(r["img_path"]) for r in (data.get("results") or [])}
             modified = set()
-            img_exts = {".jpg", ".jpeg", ".png", ".bmp"}
-            for p in self.selected_folder.iterdir():
-                if p.suffix.lower() not in img_exts:
-                    continue
+            for p in collect_images(self.selected_folder):
                 txt = p.with_suffix(".txt")
                 if not txt.exists():
                     continue
-                if txt.stat().st_mtime > ts or p.name not in cached_names:
-                    modified.add(p.name)
+                if txt.stat().st_mtime > ts or str(p) not in cached_keys:
+                    modified.add(str(p))
             return modified
         except Exception:
             return set()
@@ -2762,7 +3350,7 @@ class ReviewApp(QMainWindow):
         if not sel:
             QMessageBox.information(self, "선택 검수", "선택된 항목이 없습니다.")
             return
-        file_filter = {r["img_path"].name for r in sel}
+        file_filter = {str(r["img_path"]) for r in sel}
         self.btn_review.setEnabled(False)
         self.btn_rev_sel.setEnabled(False)
         self.progress_bar.setVisible(True)
@@ -2875,12 +3463,12 @@ class ReviewApp(QMainWindow):
         self.progress_bar.setVisible(False)
         self.btn_review.setEnabled(True)
         self.btn_partial.setEnabled(False)
-        new_map = {r["img_path"].name: r for r in new_results}
+        new_map = {str(r["img_path"]): r for r in new_results}
         merged, updated, added = [], 0, 0
         for r in self.results:
-            name = r["img_path"].name
-            if name in new_map:
-                nr = new_map.pop(name)
+            key = str(r["img_path"])
+            if key in new_map:
+                nr = new_map.pop(key)
                 if r.get("confirmed") and not nr.get("confirmed"):
                     nr["confirmed"] = True
                 merged.append(nr); updated += 1
@@ -2903,14 +3491,14 @@ class ReviewApp(QMainWindow):
     def _on_sel_review_finished(self, new_results):
         self.progress_bar.setVisible(False)
         self.btn_review.setEnabled(True)
-        new_map = {r["img_path"].name: r for r in new_results}
+        new_map = {str(r["img_path"]): r for r in new_results}
         for i, r in enumerate(self.results):
-            name = r["img_path"].name
-            if name in new_map:
+            key = str(r["img_path"])
+            if key in new_map:
                 was_conf = r.get("confirmed", False)
                 was_sel  = r.get("selected", False)
-                self.results[i] = new_map[name]
-                if was_conf and not new_map[name].get("confirmed", False):
+                self.results[i] = new_map[key]
+                if was_conf and not new_map[key].get("confirmed", False):
                     self.results[i]["confirmed"] = True
                 self.results[i]["selected"] = was_sel
         for r in self.results:
